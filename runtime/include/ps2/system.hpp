@@ -43,6 +43,7 @@ struct Options {
     bool trace_threads = false;
     bool pal = true;
     bool widescreen = false;
+    float aspect = 0;  // local change: the shape the picture is shown in (width / height); 0: 16:9 with --widescreen, else 4:3
     unsigned language = 0;  // --language: the console's language the game reads (1 English ... 7 Portuguese); 0 leaves PS2_LANGUAGE in charge
     bool rate_forced = false;
     std::uint64_t max_frames = 0;
@@ -63,7 +64,8 @@ struct Options {
     // window "not responding" after 5 s and ends the program when the player closes it (no crash line: nothing crashed). Empty when the window has a thread of its own.
     std::function<void()> keep_alive;
     std::function<void(const std::string &name, const std::uint8_t *code, std::size_t size)> on_vu_program;
-    std::string memcard_path;
+    std::string memcard_path;   // memory card slot 1 (--memcard); empty = no card
+    std::string memcard2_path;  // memory card slot 2 (--memcard2); empty = no card
     std::function<void()> on_memcard_saved;
     std::string save_state_path;
     std::uint64_t save_state_frame = 0;
@@ -180,16 +182,31 @@ void set_audio_sink(std::function<void(const std::int16_t *samples, std::size_t 
 void flush_memory_card(bool hurry = false);
 // A copy of the memory card as the game sees it now (the file may be up to 50 frames behind). false when no card is in use. With
 // wait false the card is given up after a moment if a card command holds it.
-bool memory_card_image(std::vector<std::uint8_t> &out, bool wait);
+bool memory_card_image(std::vector<std::uint8_t> &out, bool wait, int slot = 0);
+// Card swaps (the card library of a window run). slot 0 = slot 1, 1 = slot 2. The card in the slot is written and taken out at the next
+// frame and `file` put in ("" leaves the slot empty); the game sees the slot empty for a moment first, as when a card is pulled out of
+// a console. false (and why) when the game used that card in the last two seconds, or the file is the card in the other slot.
+bool swap_memory_card(int slot, const std::string &file, std::string *why = nullptr);
+// the card file in the slot ("" for none), counting a swap that is asked for but not done yet
+std::string memory_card_file(int slot);
+// the game used the card in the slot a moment ago (it may be in the middle of a load or a save)
+bool memory_card_busy(int slot);
+// Renames the card file in the slot (and its backups) while it stays in.
+bool rename_memory_card(int slot, const std::string &to, std::string *why = nullptr);
 // For a crash handler (runtime/src/iop/sio2.cpp): the newest card goes to "<card>.crash.ps2" beside the card file, never over it.
 // Returns 0 when the card had not changed since it was last written, 1 when the copy was written (`where`, if not null, names it),
 // 2 when the card was busy, 3 when the copy could not be written. It prints nothing.
-int save_memory_card_after_crash(const char **where);
+int save_memory_card_after_crash(const char **where, int slot = 0);
 
 // --- Keys of a window run (docs/play-keys.md): F5 quick save, F8 quick load, F9 problem report ---
 enum class QuickKey { save, load, report };
 // Asks for it; any thread may call this. The emulation does the work at the next frame boundary.
+// local change: the shape the picture is shown in (Options.aspect, or what --widescreen says)
+inline float display_aspect() { return g_options.aspect > 0 ? g_options.aspect : g_options.widescreen ? 16.0f / 9.0f : 4.0f / 3.0f; }
 void quick_request(QuickKey key);
+// local change: the quick menu's save state slots 1 to 10 (states/slot_<n>.state, never pruned); slot_file names one's file
+void slot_request(QuickKey key, int slot);
+std::string slot_file(int slot);
 // What the player should be told. kind: 0 working on it, 1 saved, 2 loaded, 3 report written, 4 trouble. Returns the newest message
 // that was not taken yet.
 struct QuickNotice {

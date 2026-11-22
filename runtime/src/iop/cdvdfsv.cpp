@@ -8,6 +8,7 @@
 #include "ps2/system.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <vector>
 
@@ -68,7 +69,17 @@ std::uint32_t stream_full() {
     return (g_stream_banks - 1) * (g_stream_buffer / g_stream_banks);
 }
 
-std::uint64_t delay(std::uint32_t sectors) { return usec_to_cycles(400) + static_cast<std::uint64_t>(sectors) * usec_to_cycles(200); }
+// local change: PS2_DISC_SPEED=N makes the drive N times as fast (see cdvd.cpp)
+// local change: however fast PS2_DISC_SPEED makes the drive, no read is done sooner than this (see the note at the use)
+std::uint64_t floor_cycles() {
+    static const std::uint64_t us = [] { const char *e = std::getenv("PS2_DISC_FLOOR_US"); const long v = e ? std::atol(e) : 0; return static_cast<std::uint64_t>(v < 0 ? 0 : v); }();
+    return us ? usec_to_cycles(us) : 0;
+}
+
+std::uint64_t delay(std::uint32_t sectors) {
+    static const std::uint64_t speed = [] { const char *e = std::getenv("PS2_DISC_SPEED"); const long v = e ? std::atol(e) : 1; return static_cast<std::uint64_t>(v < 1 ? 1 : v > 1000 ? 1000 : v); }();
+    return std::max<std::uint64_t>((usec_to_cycles(400) + static_cast<std::uint64_t>(sectors) * usec_to_cycles(200)) / speed + 1, floor_cycles());
+}
 
 void read_to_ee(std::uint32_t sector, std::uint32_t count, std::uint32_t dst) {
     std::vector<std::uint8_t> data(static_cast<std::size_t>(count) * disc::kSector);

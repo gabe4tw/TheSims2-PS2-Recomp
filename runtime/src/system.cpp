@@ -15,6 +15,7 @@
 #include "ps2/ee_live.hpp"
 #include "kernel.hpp"
 #include "load_stats.hpp"
+#include "ps2/game_memory.hpp"
 #include "ps2/generated.hpp"
 #include "ps2/memory.hpp"
 #include "ps2/os.hpp"
@@ -60,6 +61,66 @@ namespace ps2 {
 
 Cpu g_cpu;
 Options g_options;
+
+// local change: the quick menu's cheats and debug settings (ps2/game_memory.hpp)
+namespace {
+std::mutex g_poke_mutex;
+std::vector<GamePoke> g_forced_pokes;
+std::atomic<bool> g_forced_any{false};
+
+void poke(const GamePoke &p) {
+    if (p.addr >= kRamSize || p.addr + p.size > kRamSize) return;
+    std::uint32_t now = 0;
+    std::memcpy(&now, g_ram + p.addr, p.size);  // (little endian: the low bytes)
+    now = (now & ~p.mask) | (p.value & p.mask);
+    std::memcpy(g_ram + p.addr, &now, p.size);
+}
+
+void apply_forced_pokes() {
+    if (!g_forced_any.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lock(g_poke_mutex);
+    for (const GamePoke &p : g_forced_pokes) poke(p);
+}
+}  // namespace
+
+bool read_game_memory(std::uint32_t addr, void *out, std::uint32_t size) {
+    if (addr >= kRamSize || size > kRamSize - addr) return false;
+    std::memcpy(out, g_ram + addr, size);
+    return true;
+}
+
+bool write_game_memory(std::uint32_t addr, const void *in, std::uint32_t size) {
+    if (addr >= kRamSize || size > kRamSize - addr) return false;
+    std::memcpy(g_ram + addr, in, size);
+    return true;
+}
+
+namespace {
+struct GameCall {
+    std::uint32_t address, a0, a1;
+};
+std::vector<GameCall> g_game_calls;  // (under g_poke_mutex)
+std::atomic<bool> g_game_call_pending{false};
+}  // namespace
+
+void request_game_call(std::uint32_t address, std::uint32_t a0, std::uint32_t a1) {
+    std::lock_guard<std::mutex> lock(g_poke_mutex);
+    g_game_calls.push_back({address, a0, a1});
+    g_game_call_pending.store(true, std::memory_order_release);
+}
+
+void set_forced_pokes(const std::vector<GamePoke> &pokes) {
+    std::lock_guard<std::mutex> lock(g_poke_mutex);
+    g_forced_pokes = pokes;
+    g_forced_any.store(!pokes.empty(), std::memory_order_release);
+    for (const GamePoke &p : g_forced_pokes) poke(p);  // at once too (the game waits while the menu is open)
+}
+
+namespace {
+std::atomic<void (*)()> g_frame_hook{nullptr};
+}
+
+void set_frame_hook(void (*hook)()) { g_frame_hook.store(hook, std::memory_order_release); }
 
 bool frame_capture_requested(std::uint64_t frame) {
     if (g_options.frame_every && frame % g_options.frame_every == 0) return true;
@@ -145,7 +206,13 @@ void refill(Cpu &c) {
     set_budget(c, slice);
 }
 
-std::uint64_t frame_cycles() { return kEeClock / (g_options.pal ? 50u : 60u); }
+// local change: PS2_REFRESH_HZ=N makes the screen refresh N times a second (60, 100, 120, 144 ...) instead of the console's 50 or 60,
+// for frame rates above the console's. 0 when unset. The window's pacing uses the same number (host/window.cpp).
+std::uint32_t refresh_hz() {
+    static const std::uint32_t hz = [] { const std::string e = os::env("PS2_REFRESH_HZ"); const int v = e.empty() ? 0 : std::atoi(e.c_str()); return static_cast<std::uint32_t>(v <= 0 ? 0 : std::clamp(v, 25, 480)); }();
+    return hz;
+}
+std::uint64_t frame_cycles() { return kEeClock / (refresh_hz() ? refresh_hz() : (g_options.pal ? 50u : 60u)); }
 
 void dump_frame() {
     std::vector<std::uint32_t> rgba;
@@ -223,6 +290,24 @@ void latch_pads() {
 }
 
 void time_frames() {
+    // local change: PS2_DISC_LOG=1 prints, every 10 frames in which the disc was read, how many sectors
+    if (static const bool disc_log = std::getenv("PS2_DISC_LOG") != nullptr; disc_log && g_frames % 10 == 0) {
+        static std::uint64_t before = 0;
+        const std::uint64_t now = disc::sectors_read();
+        if (now != before) std::fprintf(stderr, "[disc] frame %llu: %llu sectors\n", static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(now - before));
+        before = now;
+    }
+    // local change: PS2_SLOW_FRAME_MS=<ms> prints every frame whose emulation took longer than that (wall clock, frame to frame), to find
+    // stutters in a headless run of a scene
+    if (static const double slow_ms = [] { const char *e = std::getenv("PS2_SLOW_FRAME_MS"); return e ? std::atof(e) : 0.0; }(); slow_ms > 0) {
+        static std::chrono::steady_clock::time_point last{};
+        const auto now = std::chrono::steady_clock::now();
+        if (last != std::chrono::steady_clock::time_point{}) {
+            const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+            if (ms > slow_ms) std::fprintf(stderr, "[slow] frame %llu: %.1f ms\n", static_cast<unsigned long long>(g_frames), ms);
+        }
+        last = now;
+    }
     static const char *spec = std::getenv("PS2_TIME");
     if (!spec) return;
     static const std::uint64_t from = std::strtoull(spec, nullptr, 10);
@@ -397,9 +482,89 @@ void vblank() {
     iop::sio2::flush_cards();
     if (g_options.trace_iop_modules && g_frames % 25 == 0) std::fprintf(stderr, "[frame] %llu prims %llu\n", static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(gs::primitives_drawn()));
     if (!g_options.frames_dir.empty() && frame_capture_requested(g_frames)) dump_frame();
+    // local change (The Sims 2 PAL SLES-53718, PS2_SIMS2_TICKFIX=1 with PS2_REFRESH_HZ=N). Two things in the game count refreshes:
+    //  - its time step: seconds per refresh, a float at 0x54F9F4 that the frame loop (0x3CF938) multiplies by the refreshes a frame
+    //    took. It is set to 1/N here on every refresh, so the game runs at its normal speed.
+    //  - a tick count its refresh handler (0x3EAE78) adds 1 to, in the object 0x497FF0 points at (+0x24). Only as many refreshes as
+    //    the console has per second may count: on the others the count is lowered by one just before the handler raises it.
+    // The sound processor gets its refresh signal at the console's rate too.
+    static const bool tick_fix = os::env("PS2_SIMS2_TICKFIX") == "1";
+    const std::uint32_t hz = refresh_hz(), base = g_options.pal ? 50u : 60u;
+    bool counted = true;
+    if (hz && hz != base) {
+        static std::uint32_t phase = 0;
+        phase += base;
+        if (phase >= hz) phase -= hz; else counted = false;
+        if (tick_fix) {
+            const float seconds = 1.0f / static_cast<float>(hz);
+            std::memcpy(g_ram + 0x54F9F4, &seconds, 4);
+            if (!counted) {
+                std::uint32_t object = 0, ticks = 0;
+                std::memcpy(&object, g_ram + 0x497FF0, 4);
+                if (object >= 0x100000u && object + 0x28u <= kRamSize) {
+                    std::memcpy(&ticks, g_ram + object + 0x24, 4);
+                    --ticks;
+                    std::memcpy(g_ram + object + 0x24, &ticks, 4);
+                }
+            }
+        }
+    }
+    // local change (The Sims 2 PAL SLES-53718, PS2_SKIP_INTRO=1): the game has a debug setting "skip_startup_movies" ("If enabled
+    // the intro movies won't be played"), registered by 0x11E318 as a byte at +0x438 of the settings object; 0x142B30 stores that
+    // object + 0x164 at 0x5186DC. So the byte is [0x5186DC] + 0x2D4. It is set on every refresh once the object exists, before the
+    // first movie starts.
+    apply_forced_pokes();
+    if (void (*hook)() = g_frame_hook.load(std::memory_order_acquire)) hook();  // local change: the host's per-refresh game logic (PC mouse)
+    // local change: the game's aspect ratio (PS2_ASPECT, main.cpp sets Options.aspect). A build made with the pnach section [Aspect
+    // from memory] has the aspect function 0x3DB168 read its value from the word at 0x3DB17C; it is written here on every refresh.
+    // Other builds (whose 0x3DB168 is not that patch) are left alone.
+    if (g_options.aspect > 0) {
+        std::uint32_t first = 0;
+        std::memcpy(&first, g_ram + 0x3DB168, 4);
+        if (first == 0x3C01003Eu) std::memcpy(g_ram + 0x3DB17C, &g_options.aspect, 4);
+    }
+    // local change, for tests: PS2_GAME_CALL_AT=frame:address:a0:a1 (hex address and arguments) asks for one game call at that frame
+    static const std::string call_at = os::env("PS2_GAME_CALL_AT");
+    if (!call_at.empty()) {
+        unsigned long long frame = 0;
+        unsigned address = 0, a0 = 0, a1 = 0;
+        if (std::sscanf(call_at.c_str(), "%llu:%x:%x:%x", &frame, &address, &a0, &a1) == 4 && g_frames == frame) request_game_call(address, a0, a1);
+    }
+    // local change, for reverse engineering: PS2_DUMP_VU1=frame:path writes VU1 data memory (16 KB) and then the VU1 float
+    // registers (32 x 16 bytes) to path at that frame
+    static const std::string dump_vu1 = os::env("PS2_DUMP_VU1");
+    if (!dump_vu1.empty()) {
+        const auto colon = dump_vu1.find(':');
+        if (colon != std::string::npos && g_frames == std::strtoull(dump_vu1.c_str(), nullptr, 10)) {
+            if (std::FILE *f = os::open(dump_vu1.substr(colon + 1), "wb")) {
+                std::fwrite(g_vu1_mem, 1, sizeof g_vu1_mem, f);
+                std::fwrite(&vu::regs(1).vf[0], 16, 32, f);
+                std::fclose(f);
+            }
+        }
+    }
+    // local change, for tests: PS2_POKE_AT=frame:address:value (hex address and 32-bit value) writes a word of main memory at that frame
+    static const std::string poke_at = os::env("PS2_POKE_AT");
+    for (std::size_t at = 0; at < poke_at.size();) {  // (several: separated by ';')
+        std::size_t end = poke_at.find(';', at);
+        if (end == std::string::npos) end = poke_at.size();
+        unsigned long long frame = 0;
+        unsigned address = 0, value = 0;
+        if (std::sscanf(poke_at.substr(at, end - at).c_str(), "%llu:%x:%x", &frame, &address, &value) == 3 && g_frames == frame)
+            write_game_memory(address, &value, 4);
+        at = end + 1;
+    }
+    static const bool skip_intro = os::env("PS2_SKIP_INTRO") == "1";
+    if (skip_intro) {
+        std::uint32_t settings = 0;
+        std::memcpy(&settings, g_ram + 0x5186DC, 4);
+        if (settings >= 0x100000u && settings + 0x2D4u < kRamSize) g_ram[settings + 0x2D4] = 1;
+    }
     hw::vblank_start();
-    iop::vblank(true);
-    schedule(hw::kEventVblankEnd + 100, now() + hblank_cycles() * 22u, [] { iop::vblank(false); });
+    if (counted) {
+        iop::vblank(true);
+        schedule(hw::kEventVblankEnd + 100, now() + hblank_cycles() * 22u, [] { iop::vblank(false); });
+    }
     kernel::on_vblank_start();
     if (g_options.max_frames && g_frames >= g_options.max_frames) halt("frame limit reached");
     if (g_options.save_state_frame && g_frames == g_options.save_state_frame) g_state_request = g_file_state_request = true;
@@ -412,6 +577,19 @@ void idle(Cpu &c) {
     if (next == UINT64_MAX && iop::idle()) {
         halt("deadlock: every thread waits and no event is pending");
         return;
+    }
+    // local change: one-shot game calls of the quick menu (ps2/game_memory.hpp), here where every game thread waits
+    if (g_game_call_pending.load(std::memory_order_acquire) && !kernel::in_handler()) {
+        std::vector<GameCall> calls;
+        {
+            std::lock_guard<std::mutex> lock(g_poke_mutex);
+            calls.swap(g_game_calls);
+            g_game_call_pending.store(false, std::memory_order_release);
+        }
+        for (const GameCall &gc : calls) {
+            std::fprintf(stderr, "[cheats] calling the game's 0x%06X(0x%X, %u) at frame %llu\n", gc.address, gc.a0, gc.a1, static_cast<unsigned long long>(g_frames));
+            kernel::call_game(c, gc.address, gc.a0, gc.a1);
+        }
     }
     next = std::min(next, now() + kEeClock / 2000);
     g_base = std::max(now(), next);
@@ -451,7 +629,7 @@ std::uint64_t rtc_seconds() {
     return static_cast<std::uint64_t>(std::time(nullptr));
 }
 
-std::uint64_t hblank_cycles() { return frame_cycles() * 2u / (g_options.pal ? 625u : 525u); }
+std::uint64_t hblank_cycles() { return kEeClock / (g_options.pal ? 50u : 60u) * 2u / (g_options.pal ? 625u : 525u); }  // local change: the console's line time, whatever PS2_REFRESH_HZ says, since alarms and timers count lines
 
 void set_budget(Cpu &c, std::int64_t cycles) {
     g_base = now();
@@ -500,7 +678,7 @@ std::uint32_t video_options() { return g_video_options.load(std::memory_order_re
 namespace {
 
 constexpr char kStateMagic[8] = {'P', 'S', '2', 'S', 'T', 'A', 'T', 'E'};
-constexpr std::uint32_t kStateVersion = 10;
+constexpr std::uint32_t kStateVersion = 12;
 
 std::function<void()> event_action(int id, std::uint64_t at) {
     if (id == hw::kEventVblank) return vblank;
@@ -531,7 +709,8 @@ void machine_state(state::Stream &s) {
     // 8 adds the IOP's low-level hardware timers (AllocHardTimer, SetTimerCompare, SetTimerMode) that raise an interrupt;
     // 9 adds the count of GS FINISH events that wait until the game has cleared CSR.FINISH;
     // 10 adds the picture pace's last picture and a hold that is due (kernel.cpp, ps2/pace.hpp).
-    if (version != kStateVersion && !(s.loading() && (version >= 4 && version <= 9))) throw std::runtime_error("state file from another version");
+    // (11 adds the USB controller and the camera, hw.cpp; 12 adds memory card slot 2, sio2.cpp.)
+    if (version != kStateVersion && !(s.loading() && (version >= 4 && version < kStateVersion))) throw std::runtime_error("state file from another version");
     s.set_version(version);
     s.tag("ee");
     s.pod(g_cpu);
@@ -626,6 +805,8 @@ bool quick_notice(QuickNotice &) { return false; }
 void quick_watchdog() {}
 std::string quick_folder(const char *) { return {}; }
 std::string quick_newest_state() { return {}; }
+void slot_request(QuickKey, int) {}
+std::string slot_file(int) { return {}; }
 #endif
 
 std::uint64_t frame_count() { return g_frames; }

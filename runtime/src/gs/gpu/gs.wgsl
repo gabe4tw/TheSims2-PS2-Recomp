@@ -737,8 +737,43 @@ fn fetch(s: Setup, xi: i32, yi: i32, k: u32) -> u32 {
     return fetch_at(s, texel_x(s, xi), texel_y(s, yi), k);
 }
 
+// local change: texture replacement (texrep in gpu.cpp). A kept texture can have a larger picture in its place, 2, 4 or 8 times
+// the size each way: the top four bits of `dec` are then the power of two, the rest is where the larger picture starts. Texel
+// (x, y) of the game's texture is the block of that many pixels from (x, y) times the factor; wrapping and clamping stay the
+// game's, on its own texel numbers.
+fn big_fetch(s: Setup, hx: i32, hy: i32) -> u32 {
+    let shift = s.dec >> 28u;
+    let n = i32(1u << shift);
+    let tx = select(hx / n, (hx - n + 1) / n, hx < 0);
+    let ty = select(hy / n, (hy - n + 1) / n, hy < 0);
+    let nx = texel_x(s, tx);
+    let ny = texel_y(s, ty);
+    let sx = u32(hx - tx * n);
+    let sy = u32(hy - ty * n);
+    let at = (s.dec & 0x0FFFFFFFu) + ((((ny << shift) + sy)) << (s.tw + shift)) + (nx << shift) + sx;
+    return decoded[min(at, arrayLength(&decoded) - 1u)];
+}
+
+fn sample_big(s: Setup, uin: f32, vin: f32) -> u32 {
+    let nf = f32(1u << (s.dec >> 28u));
+    if (!has(s, F_BILINEAR)) {
+        return big_fetch(s, i32(floor(uin * nf)), i32(floor(vin * nf)));
+    }
+    let u = uin * nf - 0.5;
+    let v = vin * nf - 0.5;
+    let x0 = i32(floor(u));
+    let y0 = i32(floor(v));
+    return blend4(big_fetch(s, x0, y0), big_fetch(s, x0 + 1, y0), big_fetch(s, x0, y0 + 1), big_fetch(s, x0 + 1, y0 + 1), u - f32(x0), v - f32(y0));
+}
+
 fn fetch_at(s: Setup, x: u32, y: u32, k: u32) -> u32 {
     if (s.dec != 0xFFFFFFFFu) {
+        let shift = s.dec >> 28u;
+        if (shift != 0u) {  // (a single texel asked for: the middle of its block)
+            let half = (1u << shift) >> 1u;
+            let at = (s.dec & 0x0FFFFFFFu) + (((y << shift) + half) << (s.tw + shift)) + (x << shift) + half;
+            return decoded[min(at, arrayLength(&decoded) - 1u)];
+        }
         // plan_decodes (gpu.cpp) gives a decoded texture only to a setup whose clamp or repeat region lies inside it, so x and y stay inside the
         // texture; the bound keeps the index inside the buffer in any case (in place of wgpu's run-time check, PS2_GPU_TRUSTED)
         return decoded[min(s.dec + (y << s.tw) + x, arrayLength(&decoded) - 1u)];
@@ -807,6 +842,9 @@ fn tap32(s: Setup, page: u32, n: u32, k: u32) -> u32 {
 // picture's own samples too (plain bilinear blends each with the same sample of the neighbouring pixel).
 override SHARP: u32 = 0u;
 var<private> sharp_sprite: bool = false;
+// local change: the texels a 2D piece made of two triangles may read (see shade_at, kind 0): min u, min v, max u, max v
+var<private> uv_box: vec4<f32> = vec4<f32>(0.0);
+var<private> uv_box_on: bool = false;
 var<private> upscaled_source: bool = false;
 
 fn sharpen(f: f32) -> f32 {
@@ -832,9 +870,50 @@ fn sample_upscaled(s: Setup, uin: f32, vin: f32) -> u32 {
     return blend4(tap_upscaled(s, x0, y0), tap_upscaled(s, x0 + 1, y0), tap_upscaled(s, x0, y0 + 1), tap_upscaled(s, x0 + 1, y0 + 1), u - f32(x0), v - f32(y0));
 }
 
+// local change: anti-aliasing "Quality" (FINE = 2, gpu.cpp; EXPERIMENTAL, PS2_AA=2 only - measured as slow as Extra, see notes): graphics memory holds the picture at twice the scale each way, and each
+// thread of `raster` draws a 2 x 2 group of those samples. Coverage, depth, the alpha test and blending are worked out per sample,
+// the texture is read once per shape for the whole group (by its first covered sample) - the costly part, as with multisampling.
+override FINE: u32 = 1u;
+var<private> memo: array<u32, 2>;  // the texture reads of this shape for the group (one per mipmap level read)
+var<private> memo_filled: u32 = 0u;
+
+fn tex_read(s: Setup, u: f32, v: f32, k: u32, i: u32) -> u32 {
+    if (FINE > 1u && i < memo_filled) {
+        return memo[i];
+    }
+    let c = sample(s, u, v, k);
+    if (FINE > 1u && i == memo_filled) {
+        memo[i] = c;
+        memo_filled = i + 1u;
+    }
+    return c;
+}
+
+// Alpha-to-coverage for cut-out textures (windows, plants, railings), with Extra (A2C, gpu.cpp) and Quality: each sample of a 2 x 2
+// group compares the alpha with a slightly different reference, so an alpha near the reference covers part of the group and the
+// present's shrinking turns that into a smooth edge. Only for the greater / less tests (equal / not equal stay exact).
+override A2C: bool = false;
+fn coverage_ref(s: Setup, k: u32) -> u32 {
+    if (FINE == 1u && !A2C) {
+        return s.aref;
+    }
+    let sub = ((k / SCALE) % 2u) * 2u + (k % SCALE) % 2u;
+    let offsets = array<i32, 4>(-15, 5, -5, 15);
+    return u32(clamp(i32(s.aref) + offsets[sub], 0, 255));
+}
+
+// local change: measuring aid (PS2_GPU_PROBE_NOTEX): no texture reads at all, to see what share of the draw time they are
+override PROBE_NOTEX: bool = false;
+
 fn sample(s: Setup, uin: f32, vin: f32, k: u32) -> u32 {
+    if (PROBE_NOTEX) {
+        return 0x80808080u;
+    }
     if (rt_copy) {
         return sample_scaled(s, uin, vin);
+    }
+    if (s.dec != 0xFFFFFFFFu && (s.dec >> 28u) != 0u) {
+        return sample_big(s, uin, vin);
     }
     if (!has(s, F_BILINEAR)) {
         return fetch(s, i32(floor(uin)), i32(floor(vin)), k);
@@ -1109,6 +1188,10 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
             u = nu * f32(1u << s.tw);
             v = nv * f32(1u << s.th);
         }
+        if (uv_box_on && has(s, F_BILINEAR)) {  // local change, see uv_box
+            u = clamp(u, uv_box.x + 0.5, max(uv_box.x + 0.5, uv_box.z - 0.5));
+            v = clamp(v, uv_box.y + 0.5, max(uv_box.y + 0.5, uv_box.w - 0.5));
+        }
         // One level (two when *_MIPMAP_LINEAR blends): without mipmap words that is level 0 with the setup as it is, as before.
         var base = s;
         var p = Pick(0u, 0.0, 0u);
@@ -1137,7 +1220,7 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
                     lv = nv * f32(1u << l.th);
                 }
             }
-            let c = sample(l, lu, lv, k);
+            let c = tex_read(l, lu, lv, k, i);
             if (i == 0u) {
                 t = c;
             } else {
@@ -1199,6 +1282,7 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
     var write_alpha = true;
     if (has(s, F_ATE)) {
         let av = u32(a);
+        let aref = coverage_ref(s, k);  // local change: Quality's per-sample reference (s.aref otherwise)
         var ok = false;
         switch mode(s, 0u, 3u) {
             case 0u {
@@ -1208,19 +1292,19 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
                 ok = true;
             }
             case 2u {
-                ok = av < s.aref;
+                ok = av < aref;
             }
             case 3u {
-                ok = av <= s.aref;
+                ok = av <= aref;
             }
             case 4u {
                 ok = av == s.aref;
             }
             case 5u {
-                ok = av >= s.aref;
+                ok = av >= aref;
             }
             case 6u {
-                ok = av > s.aref;
+                ok = av > aref;
             }
             default {
                 ok = av != s.aref;
@@ -1348,6 +1432,7 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
     upscaled_source = (data[p + 1u] & 0x100u) != 0u;
     var at: Attr;
     sharp_sprite = false;
+    uv_box_on = false;
     switch kind {
         case 0u {
             let x0 = fat(p + 4u);
@@ -1385,7 +1470,18 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             let in0 = edge_in(select(s0, ce0, a0), inclusive & 1u);
             let in1 = edge_in(select(s1, ce1, a1), inclusive & 2u);
             let in2 = edge_in(select(c2, ce2, a2), inclusive & 4u);
-            if (!in0 || !in1 || !in2) {
+            // local change: a sample that lies outside the whole rectangle (past one of its straight edges) belongs to the half
+            // that holds its console pixel's centre, whatever that half's slanted edge says. Before, the half with the straight
+            // edge refused it when the centre was in the other half, and the other half refused it for being past the slanted
+            // edge: along the last console pixel of a long thin piece (a dialog frame's side, 16 pixels wide and 300 high) a
+            // strip of samples near one corner was drawn by neither, and what lay behind showed as a thin dark line.
+            let centre_in = edge_in(ce0, inclusive & 1u) && edge_in(ce1, inclusive & 2u) && edge_in(ce2, inclusive & 4u);
+            let beyond = rect && (px < min(x0, min(x1, x2)) || px > max(x0, max(x1, x2)) || py < min(y0, min(y1, y2)) || py > max(y0, max(y1, y2)));
+            if (beyond) {
+                if (!centre_in) {
+                    return;
+                }
+            } else if (!in0 || !in1 || !in2) {
                 return;
             }
             // A sample outside such an edge is covered only when its console pixel is, i.e. when the pixel's centre is inside
@@ -1395,12 +1491,24 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             let out0 = a0 && !edge_in(s0, inclusive & 1u);
             let out1 = a1 && !edge_in(s1, inclusive & 2u);
             let out2 = a2 && !edge_in(c2, inclusive & 4u);
-            if ((out0 || out1 || out2) && !(edge_in(ce0, inclusive & 1u) && edge_in(ce1, inclusive & 2u) && edge_in(ce2, inclusive & 4u))) {
-                return;
+            // local change: this used to stop here when the sample was outside a straight edge and the pixel's centre was not
+            // inside this half ("return"). Together with the rule above that left samples inside the rectangle that neither
+            // half drew: a thin wedge beside the long edge of a narrow piece, where what lay behind showed as a dark line
+            // (The Sims 2's dialog frames, at 2x and up). The two halves now share every covered pixel's samples between
+            // them by the slanted edge alone; samples outside the rectangle are settled by `beyond` above.
+            let extended = beyond || out0 || out1 || out2;
+            var qx = select(px, cx, extended);
+            var qy = select(py, cy, extended);
+            // local change: the same as for sprites below ("Keep the sample within the native pixels the sprite covers"), for 2D
+            // pieces drawn as two triangles (The Sims 2 draws its text and icons that way). Upscaled, the extra samples of the
+            // last native pixel column and row sit past it and read up to a texel beyond the piece: the neighbour on the texture
+            // sheet showed as a thin line beside letters and icons. The piece's box is the box of this half's corners.
+            if (rect && !upscaled_source) {
+                let ax = ceil(min(x0, min(x1, x2)));
+                let ay = ceil(min(y0, min(y1, y2)));
+                qx = clamp(qx, ax, max(ax, ceil(max(x0, max(x1, x2))) - 1.0));
+                qy = clamp(qy, ay, max(ay, ceil(max(y0, max(y1, y2))) - 1.0));
             }
-            let extended = out0 || out1 || out2;
-            let qx = select(px, cx, extended);
-            let qy = select(py, cy, extended);
             let w0 = cross2(x1 - qx, y2 - qy, x2 - qx, y1 - qy) * inv;
             let w1 = cross2(x2 - qx, y0 - qy, x0 - qx, y2 - qy) * inv;
             let w2 = 1.0 - w0 - w1;
@@ -1414,6 +1522,27 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             let t2 = vertex_tex(p, 2u);
             var t = weighted4(t0, t1, t2, w0, w1, w2);
             t.w = bary1(t0.w, t1.w, t2.w, w1, w2);
+            // local change: a 2D piece (text, icons) cut from a sheet must not read the sheet beyond its own texels. Upscaled,
+            // or moved off the console's pixel grid (the interface narrowed for 16:9), samples near its edges blended in the
+            // neighbour on the sheet: thin lines beside letters and icons. The box of the three corners' texture coordinates,
+            // in texels, is kept here; the bilinear read is held half a texel inside it (below, where u and v are made).
+            if (rect && !upscaled_source) {
+                var e0 = t0.xy;
+                var e1 = t1.xy;
+                var e2 = t2.xy;
+                if (has(s, F_FST)) {
+                    e0 = e0 / 16.0;
+                    e1 = e1 / 16.0;
+                    e2 = e2 / 16.0;
+                } else {
+                    let size = vec2<f32>(f32(1u << s.tw), f32(1u << s.th));
+                    e0 = e0 / select(t0.z, 1.0, t0.z == 0.0) * size;
+                    e1 = e1 / select(t1.z, 1.0, t1.z == 0.0) * size;
+                    e2 = e2 / select(t2.z, 1.0, t2.z == 0.0) * size;
+                }
+                uv_box = vec4<f32>(min(e0, min(e1, e2)), max(e0, max(e1, e2)));
+                uv_box_on = true;
+            }
             at = Attr(c.x, c.y, c.z, c.w, t.x, t.y, t.z, t.w, z_at(p, sum2(fat(p + 25u), fat(p + 26u), w1, w2)));
         }
         case 1u {
@@ -1578,13 +1707,12 @@ fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
     }
     let tile = prm(0u) + index * 2u;
     let origin = data[tile];
-    let sx = (origin & 0xFFFFu) * TILE + lid.x;
-    let sy = (origin >> 16u) * TILE + lid.y;
+    // (Quality: a tile is TILE * FINE samples each way and this thread draws the FINE x FINE group at sx, sy; all of it lies in one
+    // console pixel, as SCALE is a multiple of FINE)
+    let sx = (origin & 0xFFFFu) * TILE * FINE + lid.x * FINE;
+    let sy = (origin >> 16u) * TILE * FINE + lid.y * FINE;
     let x = i32(sx / SCALE);
     let y = i32(sy / SCALE);
-    let k = (sy % SCALE) * SCALE + sx % SCALE;
-    let px = f32(x) + f32(sx % SCALE) / f32(SCALE);
-    let py = f32(y) + f32(sy % SCALE) / f32(SCALE);
     let first = data[tile + 1u];
     let count = data[tile + 3u] - first;
     let lists = prm(4u);
@@ -1614,6 +1742,156 @@ fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
         if (x < i32(lo & 0xFFFFu) || y < i32(lo >> 16u) || x > i32(hi & 0xFFFFu) || y > i32(hi >> 16u)) {
             continue;
         }
-        shade_at(p, s, x, y, k, px, py);
+        memo_filled = 0u;
+        for (var f = 0u; f < FINE * FINE; f = f + 1u) {
+            let fx = sx + f % FINE;
+            let fy = sy + f / FINE;
+            let k = (fy % SCALE) * SCALE + fx % SCALE;
+            let px = f32(x) + f32(fx % SCALE) / f32(SCALE);
+            let py = f32(y) + f32(fy % SCALE) / f32(SCALE);
+            shade_at(p, s, x, y, k, px, py);
+        }
     }
+}
+
+// local change: anti-aliasing "Fast" (Settings > Graphics > Anti-aliasing), three passes over the finished field before the present,
+// at the field's own size. Written from the public descriptions of morphological anti-aliasing (Reshetov 2009, MLAA) and its
+// successor's edge test (Jimenez et al. 2012, SMAA: luma edges with local contrast adaptation, line ends searched along the edge,
+// coverage area from the shape at both ends, a blend with the neighbours). No code from either; the area is worked out here from the
+// line through the ends instead of a precomputed area texture.
+// Parameters: 0 current field, 1 previous field, 2 1 = weave the two (as the present does), 3 width, 4 height,
+// 5 edges (one word per pixel: bit 0 an edge on the left side, bit 1 on the top side), 6 weights (rgba8 per pixel:
+// r = take from the top, g = give to the top (the pixel above takes from this one), b = take from the left, a = give to the left),
+// 7 the result.
+const AA_THRESHOLD: f32 = 0.08;  // smallest luma step that counts as an edge
+const AA_CONTRAST: f32 = 2.0;    // an edge much weaker than the strongest one next to it is a texture detail, not an outline
+const AA_SEARCH: i32 = 24;       // how far along an edge (pixels each way) the line ends are looked for
+
+fn aa_colour(x: i32, y: i32) -> vec3<f32> {
+    let w = i32(prm(3u));
+    let h = i32(prm(4u));
+    let at = u32(clamp(y, 0, h - 1)) * u32(w) + u32(clamp(x, 0, w - 1));
+    var c = unpack4x8unorm(scratch[prm(0u) + at]).rgb;
+    if (prm(2u) != 0u) { c = (c + unpack4x8unorm(scratch[prm(1u) + at]).rgb) * 0.5; }
+    return c;
+}
+
+fn aa_luma(x: i32, y: i32) -> f32 { return dot(aa_colour(x, y), vec3<f32>(0.2126, 0.7152, 0.0722)); }
+
+@compute @workgroup_size(8, 8)
+fn aa_edges(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= prm(3u) || gid.y >= prm(4u)) { return; }
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    let l = aa_luma(x, y);
+    let left = abs(l - aa_luma(x - 1, y));
+    let top = abs(l - aa_luma(x, y - 1));
+    var e = 0u;
+    if (gid.x > 0u && left >= AA_THRESHOLD) { e = e | 1u; }
+    if (gid.y > 0u && top >= AA_THRESHOLD) { e = e | 2u; }
+    if (e != 0u) {
+        let strongest = max(max(max(left, top), max(abs(l - aa_luma(x + 1, y)), abs(l - aa_luma(x, y + 1)))),
+                            max(abs(aa_luma(x - 1, y) - aa_luma(x - 2, y)), abs(aa_luma(x, y - 1) - aa_luma(x, y - 2))));
+        if (left * AA_CONTRAST < strongest) { e = e & ~1u; }
+        if (top * AA_CONTRAST < strongest) { e = e & ~2u; }
+    }
+    scratch[prm(5u) + gid.y * prm(3u) + gid.x] = e;
+}
+
+fn aa_edge(x: i32, y: i32) -> u32 {
+    if (x < 0 || y < 0 || x >= i32(prm(3u)) || y >= i32(prm(4u))) { return 0u; }
+    return scratch[prm(5u) + u32(y) * prm(3u) + u32(x)];
+}
+
+// The height of the reconstructed outline at one end of a run of edge: +0.5 when the outline turns towards the "above" side there
+// (a crossing edge on that side), -0.5 towards the other side, 0 when it turns both ways or not at all.
+fn aa_end(above: bool, below: bool) -> f32 {
+    if (above == below) { return 0.0; }
+    return select(-0.5, 0.5, above);
+}
+
+// The parts of the pixel [i, i + 1] of a run of length n that lie above (x) and below (y) the outline, the outline going straight from
+// height h0 at 0 to h1 at n. An end with a turn on both runs' ends the same way (a U) is two halves, each from its end down to 0.
+fn aa_area(i: f32, n: f32, h0: f32, h1: f32) -> vec2<f32> {
+    var a = 0.0;
+    var b = n;
+    var ha = h0;
+    var hb = h1;
+    if (h0 != 0.0 && h0 == h1) {  // U: the half this pixel is in
+        if (i + 0.5 < n * 0.5) { b = n * 0.5; hb = 0.0; } else { a = n * 0.5; ha = 0.0; }
+    }
+    // the line's heights at the pixel's two sides
+    let s0 = mix(ha, hb, clamp((i - a) / (b - a), 0.0, 1.0));
+    let s1 = mix(ha, hb, clamp((i + 1.0 - a) / (b - a), 0.0, 1.0));
+    if (s0 >= 0.0 && s1 >= 0.0) { return vec2<f32>((s0 + s1) * 0.5, 0.0); }
+    if (s0 <= 0.0 && s1 <= 0.0) { return vec2<f32>(0.0, -(s0 + s1) * 0.5); }
+    // the line crosses the edge inside this pixel: a triangle on each side
+    let t = s0 / (s0 - s1);
+    return vec2<f32>(max(s0, 0.0) * t * 0.5 + max(s1, 0.0) * (1.0 - t) * 0.5, max(-s0, 0.0) * t * 0.5 + max(-s1, 0.0) * (1.0 - t) * 0.5);
+}
+
+@compute @workgroup_size(8, 8)
+fn aa_weights(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= prm(3u) || gid.y >= prm(4u)) { return; }
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    let e = aa_edge(x, y);
+    var w = vec4<f32>(0.0);
+    if ((e & 2u) != 0u) {  // an edge between this row and the one above: follow it left and right
+        var l = 0;
+        loop { if (l >= AA_SEARCH || (aa_edge(x - l - 1, y) & 2u) == 0u) { break; } l = l + 1; }
+        var r = 0;
+        loop { if (r >= AA_SEARCH || (aa_edge(x + r + 1, y) & 2u) == 0u) { break; } r = r + 1; }
+        // crossing edges at both ends (vertical edges on the line's left end x - l and right end x + r + 1), above and below the line
+        let h0 = aa_end((aa_edge(x - l, y - 1) & 1u) != 0u, (aa_edge(x - l, y) & 1u) != 0u);
+        let h1 = aa_end((aa_edge(x + r + 1, y - 1) & 1u) != 0u, (aa_edge(x + r + 1, y) & 1u) != 0u);
+        if (h0 != 0.0 || h1 != 0.0) {
+            let a = aa_area(f32(l), f32(l + r + 1), h0, h1);
+            w.x = a.y;  // the outline dips into this pixel: it takes from the one above
+            w.y = a.x;  // the outline rises into the pixel above: that one takes from this one
+        }
+    }
+    if ((e & 1u) != 0u) {  // an edge between this column and the one to the left: follow it up and down
+        var u = 0;
+        loop { if (u >= AA_SEARCH || (aa_edge(x, y - u - 1) & 1u) == 0u) { break; } u = u + 1; }
+        var d = 0;
+        loop { if (d >= AA_SEARCH || (aa_edge(x, y + d + 1) & 1u) == 0u) { break; } d = d + 1; }
+        let h0 = aa_end((aa_edge(x - 1, y - u) & 2u) != 0u, (aa_edge(x, y - u) & 2u) != 0u);
+        let h1 = aa_end((aa_edge(x - 1, y + d + 1) & 2u) != 0u, (aa_edge(x, y + d + 1) & 2u) != 0u);
+        if (h0 != 0.0 || h1 != 0.0) {
+            let a = aa_area(f32(u), f32(u + d + 1), h0, h1);
+            w.z = a.y;
+            w.w = a.x;
+        }
+    }
+    scratch[prm(6u) + gid.y * prm(3u) + gid.x] = pack4x8unorm(w);
+}
+
+fn aa_weight(x: i32, y: i32) -> vec4<f32> {
+    if (x < 0 || y < 0 || x >= i32(prm(3u)) || y >= i32(prm(4u))) { return vec4<f32>(0.0); }
+    return unpack4x8unorm(scratch[prm(6u) + u32(y) * prm(3u) + u32(x)]);
+}
+
+@compute @workgroup_size(8, 8)
+fn aa_blend(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= prm(3u) || gid.y >= prm(4u)) { return; }
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    let own = aa_weight(x, y);
+    let top = own.x;
+    let bottom = aa_weight(x, y + 1).y;
+    let left = own.z;
+    let right = aa_weight(x + 1, y).w;
+    var c = aa_colour(x, y);
+    // one direction only (the stronger), as a single slanted outline has one
+    if (max(top, bottom) + max(left, right) > 0.0) {
+        if (max(top, bottom) >= max(left, right)) {
+            let s = max(1.0, top + bottom);
+            c = c * (1.0 - (top + bottom) / s) + (aa_colour(x, y - 1) * top + aa_colour(x, y + 1) * bottom) / s;
+        } else {
+            let s = max(1.0, left + right);
+            c = c * (1.0 - (left + right) / s) + (aa_colour(x - 1, y) * left + aa_colour(x + 1, y) * right) / s;
+        }
+    }
+    scratch[prm(7u) + gid.y * prm(3u) + gid.x] = pack4x8unorm(vec4<f32>(c, 1.0));
 }

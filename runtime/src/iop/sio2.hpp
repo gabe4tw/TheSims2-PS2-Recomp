@@ -24,7 +24,12 @@ void set_connected(int pad, bool connected);
 std::uint16_t rumble(int pad);
 void flush_cards();
 void flush_cards_now(bool hurry);
-bool card_image(std::vector<std::uint8_t> &out, bool wait);
+bool card_image(std::vector<std::uint8_t> &out, bool wait, int slot = 0);
+int save_card_after_crash(const char **where, int slot);
+bool request_swap(int slot, const std::string &file, std::string *why);
+std::string card_file(int slot);
+bool card_busy(int slot);
+bool rename_card(int slot, const std::string &to, std::string *why);
 // a card image (16384 pages of 528 bytes): what is wrong with it, empty when it is whole; the 16 spare bytes of a page's 512 data bytes
 std::string card_problem(const std::uint8_t *data, std::size_t size);
 void page_ecc(const std::uint8_t *data, std::uint8_t *spare);

@@ -483,6 +483,13 @@ bool must_unwind() {
 }
 
 bool in_handler() { return g_in_handler; }
+
+// local change (the quick menu's horn cheat, ps2/game_memory.hpp): calls a game function the way an interrupt handler is called. Only
+// from system.cpp's idle(), when every game thread waits in the kernel, so no game code is half way through anything.
+std::uint32_t call_game(Cpu &c, std::uint32_t address, std::uint32_t a0, std::uint32_t a1) {
+    if (g_in_handler) return 0;
+    return run_guest(c, address, a0, a1, 0, 0);
+}
 bool interruptible() { return interrupts_enabled() && !g_in_handler; }
 int current_thread() { return g_current; }
 

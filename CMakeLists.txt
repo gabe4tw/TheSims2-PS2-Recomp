@@ -71,6 +71,7 @@ else()
         runtime/src/ee_live.cpp
         runtime/src/ipu/ipu.cpp
         runtime/src/gs/gs.cpp
+        runtime/src/gs/texpack.cpp
         runtime/src/gs/gif.cpp
         runtime/src/gs/queue.cpp
         runtime/src/gs/raster.cpp
@@ -83,7 +84,9 @@ else()
         runtime/src/iop/io.cpp
         runtime/src/iop/cdvd.cpp
         runtime/src/iop/sif.cpp
-        runtime/src/iop/cdvdfsv.cpp)
+        runtime/src/iop/cdvdfsv.cpp
+        runtime/src/iop/usb.cpp
+        runtime/src/iop/eyetoy.cpp)
     target_compile_options(ps2runtime PRIVATE -Wall -Wextra)
     if(NOT EMSCRIPTEN)
         # Vector programs the build does not know are compiled while the game runs (runtime/src/vu_live.cpp, docs/vu-live.md): the
@@ -124,6 +127,13 @@ if(NOT EMSCRIPTEN)
     # the emulation thread's big stack (host/big_stack_thread.hpp), no game and no runtime needed: ninja ps2bigstacktest
     add_executable(ps2bigstacktest EXCLUDE_FROM_ALL tests/big_stack.cpp)
     target_link_libraries(ps2bigstacktest PRIVATE pthread)
+    # the virtual EyeToy's picture encoder decoded by the runtime's IPU, no game needed: ninja ps2eyetoytest
+    add_executable(ps2eyetoytest EXCLUDE_FROM_ALL tests/eyetoy_roundtrip.cpp)
+    target_include_directories(ps2eyetoytest PRIVATE runtime/src)
+    target_link_libraries(ps2eyetoytest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2eyetoytest PRIVATE synchronization)
+    endif()
     # the memory card file and save state writes, no game needed: ninja ps2savetest
     add_executable(ps2savetest EXCLUDE_FROM_ALL tests/save_files.cpp)
     target_include_directories(ps2savetest PRIVATE runtime/src)
@@ -134,6 +144,13 @@ if(NOT EMSCRIPTEN)
     # which graphics chips get the draw program without wgpu's run-time checks by default (no game, no graphics): ninja ps2trustedtest
     add_executable(ps2trustedtest EXCLUDE_FROM_ALL tests/trusted_shader.cpp)
     target_include_directories(ps2trustedtest PRIVATE runtime/src)
+    # local change: PCSX2-style texture packs found by picture (runtime/src/gs/texpack.cpp), no game needed: ninja ps2texpacktest
+    add_executable(ps2texpacktest EXCLUDE_FROM_ALL tests/texpack.cpp)
+    target_include_directories(ps2texpacktest PRIVATE runtime/src)
+    target_link_libraries(ps2texpacktest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2texpacktest PRIVATE synchronization)
+    endif()
     # the picture pace's hold (runtime/include/ps2/pace.hpp) with made-up games, no game and no runtime needed: ninja ps2pacetest
     add_executable(ps2pacetest EXCLUDE_FROM_ALL tests/pace.cpp)
     target_include_directories(ps2pacetest PRIVATE runtime/include)
@@ -476,6 +493,30 @@ if(PS2_GENERATED)
 
     add_executable(ps2run host/main.cpp host/crash.cpp)  # crash.cpp: the lines a crash writes to the log
     target_link_libraries(ps2run PRIVATE ps2game ps2runtime)
+    # local change: the PC's webcam as the game's EyeToy (host/webcam.cpp, Media Foundation on Windows)
+    target_sources(ps2run PRIVATE host/webcam.cpp)
+    # local change: the memory card library (named card files, slot 1 / 2; host/card_library.cpp), no game needed: ninja ps2cardlibtest
+    target_sources(ps2run PRIVATE host/card_library.cpp host/remaster_ini.cpp host/settings_fill.cpp host/card_page.cpp host/mod_library.cpp)
+    # local change: remaster.ini (host/remaster_ini.cpp): ninja ps2remasterinitest
+    add_executable(ps2remasterinitest EXCLUDE_FROM_ALL tests/remaster_ini.cpp host/remaster_ini.cpp)
+    target_link_libraries(ps2remasterinitest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2remasterinitest PRIVATE synchronization)
+    endif()
+    # local change: mods part 1 (host/mod_library.cpp; launcher stage 3), no game needed: ninja ps2modlibtest
+    add_executable(ps2modlibtest EXCLUDE_FROM_ALL tests/mod_library.cpp host/mod_library.cpp)
+    target_link_libraries(ps2modlibtest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2modlibtest PRIVATE synchronization)
+    endif()
+    add_executable(ps2cardlibtest EXCLUDE_FROM_ALL tests/card_library.cpp host/card_library.cpp)
+    target_link_libraries(ps2cardlibtest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2cardlibtest PRIVATE synchronization)
+    endif()
+    if(WIN32)
+        target_link_libraries(ps2run PRIVATE mfplat mf mfreadwrite mfuuid ole32)
+    endif()
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
         target_sources(ps2run PRIVATE host/profile.cpp)
         target_compile_definitions(ps2run PRIVATE PS2_PROFILE)
@@ -501,8 +542,11 @@ if(PS2_GENERATED)
     endif()
     find_package(SDL2 QUIET)
     if(SDL2_FOUND AND NOT EMSCRIPTEN)
-        target_sources(ps2run PRIVATE host/window.cpp host/keymap.cpp host/quickmenu.cpp host/stretch.cpp)
+        # local change: the quick menu's drawing (shapes, font) is in host/menu_*.cpp
+        set(PS2_MENU_SOURCES host/quickmenu.cpp host/menu_draw.cpp host/menu_font.cpp host/menu_sound.cpp)
+        target_sources(ps2run PRIVATE host/window.cpp host/keymap.cpp host/mouse_pc.cpp ${PS2_MENU_SOURCES} host/stretch.cpp)
         target_compile_definitions(ps2run PRIVATE PS2_WINDOW)
+        include_directories(third_party/stb)  # local change: stb_truetype.h for the quick menu's font (host/menu_font.cpp)
         target_link_libraries(ps2run PRIVATE SDL2::SDL2)
         if(WIN32)
             add_custom_command(TARGET ps2run POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:SDL2::SDL2> $<TARGET_FILE_DIR:ps2run>)
@@ -519,8 +563,61 @@ if(PS2_GENERATED)
             set_target_properties(ps2run PROPERTIES WIN32_EXECUTABLE ON)
         endif()
         # the game controller path tested with SDL's virtual controllers, no game needed: ninja -C build/native-<game> ps2padtest
-        add_executable(ps2padtest EXCLUDE_FROM_ALL host/pad_test.cpp host/window.cpp host/keymap.cpp host/quickmenu.cpp host/stretch.cpp)
+        add_executable(ps2padtest EXCLUDE_FROM_ALL host/pad_test.cpp host/window.cpp host/keymap.cpp host/mouse_pc.cpp ${PS2_MENU_SOURCES} host/stretch.cpp host/card_library.cpp host/remaster_ini.cpp host/settings_fill.cpp host/card_page.cpp)
         target_include_directories(ps2padtest PRIVATE runtime/src)
         target_link_libraries(ps2padtest PRIVATE ps2runtime SDL2::SDL2)
+        # local change: the PC mouse's math (host/mouse_pc.cpp: floor under the pointer, edge scroll): ninja ps2mousetest
+        add_executable(ps2mousetest EXCLUDE_FROM_ALL tests/mouse_pc.cpp host/mouse_pc.cpp)
+        target_include_directories(ps2mousetest PRIVATE runtime/include)
+        target_link_libraries(ps2mousetest PRIVATE ps2runtime)
+        # local change: the quick menu's parts, no game and no window needed: ninja ps2menudrawtest (shapes)
+        add_executable(ps2menudrawtest EXCLUDE_FROM_ALL tests/menu_draw.cpp host/menu_draw.cpp)
+        # (text: ninja ps2menufonttest, then ./ps2menufonttest games/sims2/menu/menu.ttf from the repo root)
+        add_executable(ps2menufonttest EXCLUDE_FROM_ALL tests/menu_font.cpp host/menu_font.cpp host/menu_draw.cpp)
+        # (pages, tabs, controls and their drawing: ninja ps2menutest)
+        add_executable(ps2menutest EXCLUDE_FROM_ALL tests/menu_model.cpp host/quickmenu.cpp host/menu_draw.cpp host/menu_font.cpp)
+        # (pictures of every page to look at: ninja ps2menushots, then ./ps2menushots <folder> games/sims2/menu/menu.ttf)
+        add_executable(ps2menushots EXCLUDE_FROM_ALL tests/menu_shots.cpp host/quickmenu.cpp host/menu_draw.cpp host/menu_font.cpp)
+        # local change: the Settings page's values without a window (host/settings_fill.cpp): ninja ps2settingsfilltest
+        add_executable(ps2settingsfilltest EXCLUDE_FROM_ALL tests/settings_fill.cpp host/settings_fill.cpp host/remaster_ini.cpp host/quickmenu.cpp host/menu_draw.cpp host/menu_font.cpp)
+        target_link_libraries(ps2settingsfilltest PRIVATE ps2runtime)
+        # local change: the Memory cards page's actions (host/card_page.cpp): ninja ps2cardpagetest
+        add_executable(ps2cardpagetest EXCLUDE_FROM_ALL tests/card_page.cpp host/card_page.cpp host/card_library.cpp host/quickmenu.cpp host/menu_draw.cpp host/menu_font.cpp)
+        target_link_libraries(ps2cardpagetest PRIVATE ps2runtime)
+        # local change: the launcher, Sims2Launcher.exe (Play / Memory cards / Mods / Settings / Quit; no game code): ninja ps2launch
+        add_executable(ps2launch host/launcher_main.cpp host/launcher_config.cpp host/launcher_os.cpp host/launcher_frame.cpp host/launcher_install.cpp host/launcher_net.cpp host/launcher_update.cpp host/remaster_ini.cpp host/settings_fill.cpp
+                       host/mod_library.cpp host/launcher_mods.cpp host/hd_pack.cpp host/card_page.cpp host/card_library.cpp host/keymap.cpp host/webcam.cpp ${PS2_MENU_SOURCES})
+        set_target_properties(ps2launch PROPERTIES OUTPUT_NAME Sims2Launcher)
+        target_include_directories(ps2launch PRIVATE runtime/include)
+        target_link_libraries(ps2launch PRIVATE ps2runtime SDL2::SDL2)
+        if(WIN32)
+            target_link_libraries(ps2launch PRIVATE mfplat mf mfreadwrite mfuuid ole32 synchronization winhttp bcrypt)
+            set_target_properties(ps2launch PROPERTIES WIN32_EXECUTABLE ON)
+        endif()
+        # local change: the launcher's Mods page helpers (host/launcher_mods.cpp; stage 3): ninja ps2launchermodstest
+        add_executable(ps2launchermodstest EXCLUDE_FROM_ALL tests/launcher_mods.cpp host/launcher_mods.cpp host/mod_library.cpp host/hd_pack.cpp host/launcher_install.cpp host/launcher_net.cpp
+                       host/launcher_os.cpp host/launcher_config.cpp host/remaster_ini.cpp host/keymap.cpp)
+        target_include_directories(ps2launchermodstest PRIVATE runtime/include)
+        target_link_libraries(ps2launchermodstest PRIVATE ps2runtime SDL2::SDL2 winhttp bcrypt synchronization)
+        # local change: the launcher's update check (host/launcher_update.cpp): ninja ps2updatetest
+        add_executable(ps2updatetest EXCLUDE_FROM_ALL tests/launcher_update.cpp host/launcher_update.cpp host/launcher_net.cpp)
+        target_include_directories(ps2updatetest PRIVATE runtime/include)
+        target_link_libraries(ps2updatetest PRIVATE ps2runtime winhttp bcrypt)
+        # local change: the launcher's install logic (host/launcher_install.cpp): ninja ps2installtest (run from the repo root)
+        add_executable(ps2installtest EXCLUDE_FROM_ALL tests/launcher_install.cpp host/launcher_install.cpp host/hd_pack.cpp host/launcher_net.cpp host/launcher_os.cpp host/launcher_config.cpp
+                       host/remaster_ini.cpp host/keymap.cpp)
+        target_include_directories(ps2installtest PRIVATE runtime/include)
+        target_link_libraries(ps2installtest PRIVATE ps2runtime SDL2::SDL2 winhttp bcrypt)
+        if(WIN32)
+            target_link_libraries(ps2installtest PRIVATE synchronization)
+        endif()
+        # local change: the borderless launcher window's picture (host/launcher_frame.cpp): ninja ps2launcherframetest
+        add_executable(ps2launcherframetest EXCLUDE_FROM_ALL tests/launcher_frame.cpp host/launcher_frame.cpp)
+        # local change: the launcher's config and Play's decisions (host/launcher_config.cpp): ninja ps2launchertest
+        add_executable(ps2launchertest EXCLUDE_FROM_ALL tests/launcher_config.cpp host/launcher_config.cpp host/remaster_ini.cpp host/keymap.cpp)
+        target_link_libraries(ps2launchertest PRIVATE ps2runtime SDL2::SDL2)
+        foreach(menu_test ps2menudrawtest ps2menufonttest ps2menutest ps2menushots ps2settingsfilltest ps2cardpagetest ps2launchertest)
+            target_include_directories(${menu_test} PRIVATE runtime/include)  # ps2/os.hpp: UTF-8 paths and variables
+        endforeach()
     endif()
 endif()

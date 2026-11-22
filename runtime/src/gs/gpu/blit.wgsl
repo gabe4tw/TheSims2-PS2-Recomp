@@ -43,6 +43,8 @@ fn texel(base: u32, x: i32, y: i32) -> vec4<f32> {
 fn sample(base: u32, uv: vec2<f32>) -> vec4<f32> {
     let size = vec2<f32>(f32(blit.width), f32(blit.height));
     let t = uv * size;
+    // local change: filter Off (bits 1 and 2 both set): the plain source pixel, nothing blended
+    if ((blit.options & 6u) == 6u) { return texel(base, i32(floor(t.x)), i32(floor(t.y))); }
     var p: vec2<f32>;
     if ((blit.options & 6u) != 0u) {
         p = t - 0.5;
@@ -213,17 +215,57 @@ fn reduced_scene(uv: vec2<f32>) -> vec3<f32> {
     return sum / f32(n.x * n.y);
 }
 
+// local change: smoothing colour bands (bits 8 and 9 of the options: 0 off, 1 light, 2 strong). Much of the game's art is 16-bit
+// colour, 32 steps per channel, which shows as bands in skies and gradients. Four times, with a growing reach, four source
+// pixels around the position (a random direction and its three quarter turns) are averaged; when that average and all four
+// pixels are close to the colour so far, the average replaces it. Across a real edge the pixels differ too much and nothing
+// changes. A last half step of noise keeps the smoothed slope from banding again in the 8-bit output.
+fn hash21(p: vec2<f32>, k: f32) -> f32 {
+    return fract(sin(dot(p, vec2<f32>(12.9898, 78.233)) + k * 37.719) * 43758.5453);
+}
+
+fn max3(v: vec3<f32>) -> f32 { return max(v.x, max(v.y, v.z)); }
+
+fn deband(uv: vec2<f32>, start: vec3<f32>) -> vec3<f32> {
+    let level = (blit.options >> 8u) & 3u;
+    if (level == 0u) { return start; }
+    let size = vec2<f32>(f32(blit.width), f32(blit.height));
+    let pos = floor(uv * vec2<f32>(f32(blit.out_width), f32(blit.out_height)));
+    let p = uv * size;
+    let threshold = select(5.5, 10.0, level == 2u) / 255.0;
+    let reach = 6.0 * size.y / 512.0;
+    var c = start;
+    for (var i = 1; i <= 4; i = i + 1) {
+        let angle = hash21(pos, f32(i)) * 6.2831853;
+        let r = (0.35 + 0.65 * hash21(pos.yx, f32(i) + 9.0)) * reach * f32(i);
+        let d = vec2<f32>(cos(angle), sin(angle)) * r;
+        let a = scene_texel(i32(p.x + d.x), i32(p.y + d.y));
+        let b = scene_texel(i32(p.x - d.x), i32(p.y - d.y));
+        let e = scene_texel(i32(p.x - d.y), i32(p.y + d.x));
+        let f = scene_texel(i32(p.x + d.y), i32(p.y - d.x));
+        let average = (a + b + e + f) * 0.25;
+        let spread = max(max(max3(abs(a - c)), max3(abs(b - c))), max(max3(abs(e - c)), max3(abs(f - c))));
+        if (max3(abs(average - c)) < threshold && spread < 2.0 * threshold) { c = average; }
+    }
+    return c + (hash21(pos, 77.0) - 0.5) / 255.0;
+}
+
 @fragment
 fn fs(in: VertexOut) -> @location(0) vec4<f32> {
     var c: vec3<f32>;
-    if (blit.width > blit.out_width + blit.out_width / 16u || blit.height > blit.out_height + blit.out_height / 16u) {
-        return vec4<f32>(clamp(reduced_scene(in.uv), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    // local change: the area average only for a picture more than a quarter bigger than the window (supersampling, anti-aliasing 2x..8x);
+    // a little bigger (a PAL field at 3x is 1920 x 1533 on a 1440-line screen) keeps the chosen filter, which it used to skip (1/16)
+    if ((blit.options & 6u) != 6u && (blit.width > blit.out_width + blit.out_width / 4u || blit.height > blit.out_height + blit.out_height / 4u)) {
+        return vec4<f32>(clamp(deband(in.uv, reduced_scene(in.uv)), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
     }
-    if ((blit.options & 4u) != 0u) {
+    if ((blit.options & 6u) == 4u) {
         c = sharp_scene(in.uv);
     } else {
         c = scene(in.uv);
     }
-    if ((blit.options & 1u) != 0u) { c = edge_aa(in.uv, c); }
+    // local change: option bit 0 (anti-aliasing Fast) is done before the present now (aa_* in gs.wgsl); the old one-pass filter stays
+    // for side-by-side checks only (bit 4, PS2_AA_OLD=1).
+    if ((blit.options & 16u) != 0u) { c = edge_aa(in.uv, c); }
+    c = deband(in.uv, c);
     return vec4<f32>(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }

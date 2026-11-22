@@ -8,4 +8,9 @@ namespace ps2 {
 // bit 1: soft enlargement (a smooth blend everywhere) instead of the sharp one (hard pixels, only their borders blend).
 void set_video_options(std::uint32_t options);
 std::uint32_t video_options();
+// local change: texture replacement (runtime/src/gs/gpu/gpu.cpp, texrep). Larger pictures from the folder PS2_TEX_PACK names are
+// shown in place of the game's textures while "enhanced" is on; off shows the original ones. Switching needs no restart.
+void set_textures_enhanced(bool on);
+bool textures_enhanced();
+bool textures_available();  // the folder is set and holds pictures
 }

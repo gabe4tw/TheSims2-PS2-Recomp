@@ -78,6 +78,12 @@ struct Card {
     std::atomic<bool> dirty{false};
     std::atomic<std::uint32_t> quiet{0};  // frames since the last change; the file is written after 50
     std::uint64_t reads = 0, writes = 0, erases = 0, reported = 0;  // pages read, pages written, blocks erased (one line at the end of the run)
+    std::uint64_t used_at = 0;   // frame of the last card command (a card the game used a moment ago is not swapped)
+    bool ever_used = false;
+    // After a swap the slot looks empty to the game for a while (a card pulled out and another put in, as on a console): until
+    // `absent_left` card commands were refused AND the frame `absent_until` has come. mcman then reads the new card from scratch.
+    std::uint32_t absent_left = 0;
+    std::uint64_t absent_until = 0;
 };
 
 std::uint32_t g_send3[16];
@@ -89,8 +95,17 @@ Pad g_pads[2];
 // which ports the host has a controller in; kept out of save states so loading one does not unplug a pad
 bool g_plugged[2] = {true, false};
 Feel g_feel[2];
-Card g_card;
+// index 0 = memory card slot 1 (SIO2 port 2, --memcard), 1 = slot 2 (port 3, --memcard2)
+Card g_cards[2];
 Dma g_dma[2];
+
+// A swap or a rename asked for by the host (the card library in the quick menu), done on the emulation thread at the next frame
+struct SwapRequest {
+    bool pending = false;
+    std::string file;  // "" = leave the slot empty
+};
+std::mutex g_swap_lock;
+SwapRequest g_swaps[2];
 
 void no_device() { g_stat |= 0xC000u | (0x10000u << (g_index & 15u)); }
 
@@ -505,19 +520,43 @@ bool restore_backup(const std::string &named, bool empty, std::vector<std::uint8
 // cannot be used is left exactly as it is, and the run uses a fresh card beside it ("<name>.fresh.ps2", loaded if an earlier run
 // made it), so the game can still save. A second run with the same --memcard gets no card at all: two runs would each write their
 // own card over the other's saves.
-void load_card() {
-    Card &c = g_card;
-    if (c.present || c.looked || g_options.memcard_path.empty()) return;
+// the same file, however it is written (relative / absolute, case on Windows)
+bool same_file(const std::string &a, const std::string &b) {
+    if (a.empty() || b.empty()) return false;
+    std::error_code error;
+    const std::filesystem::path pa = std::filesystem::weakly_canonical(os::path(a), error);
+    if (error) return a == b;
+    const std::filesystem::path pb = std::filesystem::weakly_canonical(os::path(b), error);
+    if (error) return a == b;
+#ifdef _WIN32
+    std::wstring wa = pa.wstring(), wb = pb.wstring();
+    std::transform(wa.begin(), wa.end(), wa.begin(), ::towlower);
+    std::transform(wb.begin(), wb.end(), wb.begin(), ::towlower);
+    return wa == wb;
+#else
+    return pa == pb;
+#endif
+}
+
+// `slot` 0 or 1; `named` the card file (empty: the slot stays empty)
+void load_card(int slot, const std::string &named) {
+    Card &c = g_cards[slot];
+    if (c.present || c.looked || named.empty()) return;
     std::lock_guard<std::mutex> hold(c.lock);
     c.looked = true;
-    const std::string &named = g_options.memcard_path;
+    const int n = slot + 1;
+    const Card &other = g_cards[1 - slot];
+    if (other.present && (same_file(other.file, named) || same_file(beside(other.file, "fresh"), named) || same_file(other.file, beside(named, "fresh")))) {
+        std::fprintf(stderr, "[mc] warning: %s is already the card in slot %d; one card cannot be in both slots, so slot %d stays empty.\n", named.c_str(), 2 - slot, n);
+        return;
+    }
     const std::string fresh = beside(named, "fresh");
     bool busy = false;
     std::string why;
     if (!c.owner.take(named + ".lock", busy, why)) {
         if (busy) {
             std::fprintf(stderr, "[mc] warning: another copy of the game is running with the memory card %s.\n", named.c_str());
-            std::fprintf(stderr, "[mc]          Two runs would write their saves over each other's, so this run has no card in slot 1.\n");
+            std::fprintf(stderr, "[mc]          Two runs would write their saves over each other's, so this run has no card in slot %d.\n", n);
             return;
         }
         std::fprintf(stderr, "[mc] note: cannot make the lock file %s.lock (%s); the card is used without it.\n", named.c_str(), why.c_str());
@@ -550,7 +589,8 @@ void load_card() {
         c.file = fresh;
         got = read_card_file(fresh, data, why);
         if (got == CardFile::unusable || got == CardFile::damaged) {
-            std::fprintf(stderr, "[mc] warning: %s cannot be used either: %s. No card is in slot 1; nothing is written.\n", fresh.c_str(), why.c_str());
+            std::fprintf(stderr, "[mc] warning: %s cannot be used either: %s. No card is in slot %d; nothing is written.\n", fresh.c_str(), why.c_str(), n);
+            c.owner.release();
             return;
         }
     } else if (exists(fresh)) {
@@ -564,17 +604,24 @@ void load_card() {
     if (got == CardFile::good) c.data.swap(data);
     else c.data.assign(kCardBytes, 0xFF);
     c.present = true;
-    std::fprintf(stderr, "[mc] card in slot 1: %s%s\n", c.file.c_str(), got == CardFile::good ? "" : " (new, unformatted)");
+    std::fprintf(stderr, "[mc] card in slot %d: %s%s\n", n, c.file.c_str(), got == CardFile::good ? "" : " (new, unformatted)");
 }
 
-void memory_card(std::size_t at, std::uint32_t out_size) {
-    Card &c = g_card;
+void memory_card(int slot, std::size_t at, std::uint32_t out_size) {
+    Card &c = g_cards[slot];
     std::lock_guard<std::mutex> hold(c.lock);
     const std::vector<std::uint8_t> in(g_in.begin(), g_in.end());
+    if (c.present && (c.absent_left > 0 || ps2::frames_run() < c.absent_until)) {
+        if (c.absent_left > 0) --c.absent_left;  // a card was just swapped: the slot is empty for now
+        no_device();
+        return;
+    }
     if (!c.present || in.size() < 2 || in[0] != 0x81) {
         no_device();
         return;
     }
+    c.used_at = ps2::frames_run();
+    c.ever_used = true;
     const std::size_t n = out_size;
     auto put = [&](std::size_t i, std::uint8_t v) {
         if (i < n) g_out[at + i] = v;
@@ -669,7 +716,7 @@ void process() {
     for (std::uint32_t i = 0; i < out_size; ++i) g_out.push_back(0xFF);
     if (g_index == 0) g_stat = 0x1100u;
     const std::uint32_t device = g_ctrl2[port];
-    if (port == 2) memory_card(at, out_size);
+    if (port == 2 || port == 3) memory_card(port - 2, at, out_size);
     else if (device == 0x5FFFFu || device == 0x00030064u || port >= 2) no_device();
     else controller(port, at, out_size);
     g_in.clear();
@@ -724,7 +771,8 @@ void reset() {
         f.rumble.store(0);
     }
     g_dma[0] = g_dma[1] = Dma{};
-    load_card();
+    load_card(0, g_options.memcard_path);
+    load_card(1, g_options.memcard2_path);
 }
 
 namespace {
@@ -779,8 +827,7 @@ void test_hook(Card &c) {
 // Writes the card file if the game changed the card since the last write. In a hurry (Ctrl+C, the console or terminal closing)
 // the card lock is waited for only a moment; a card command that still holds it is in the middle of changing a page, so then
 // the file is not written at all and keeps the last whole card.
-void write_card(bool hurry) {
-    Card &c = g_card;
+void write_card(Card &c, bool hurry) {
     if (!c.present || !c.dirty || c.file.empty()) return;
     std::unique_lock<std::mutex> hold(c.lock, std::defer_lock);
     if (!hurry) hold.lock();
@@ -803,26 +850,102 @@ void write_card(bool hurry) {
     if (g_options.on_memcard_saved) g_options.on_memcard_saved();
 }
 
+// Takes the card out of its slot: the file is written if the card changed, the lock is given back, the slot is empty.
+void close_card(Card &c) {
+    write_card(c, false);
+    std::lock_guard<std::mutex> hold(c.lock);
+    if (c.dirty) std::fprintf(stderr, "[mc] warning: %s could not be written before the card was taken out\n", c.file.c_str());
+    c.owner.release();
+    c.present = false;
+    c.looked = false;
+    c.file.clear();
+    c.crash_file.clear();
+    c.backed_up = false;
+    c.data.clear();
+    c.data.shrink_to_fit();
+    c.address = 0;
+    c.term = 0x55;
+    c.dirty = false;
+    c.quiet = 0;
+    c.reads = c.writes = c.erases = c.reported = 0;
+    c.ever_used = false;
+    c.absent_left = 0;
+    c.absent_until = 0;
 }
 
-// every frame: the file is written 50 frames after the card was last changed (a game writes it in many small steps)
+// A card the game used less than this many frames ago may be in the middle of a load or a save: it is not swapped.
+constexpr std::uint64_t kBusyFrames = 120;
+
+bool card_busy(const Card &c) {
+    return c.present && (c.dirty || (c.ever_used && ps2::frames_run() < c.used_at + kBusyFrames));
+}
+
+void do_swaps() {
+    SwapRequest want[2];
+    {
+        std::lock_guard<std::mutex> hold(g_swap_lock);
+        for (int slot = 0; slot < 2; ++slot) {
+            want[slot] = g_swaps[slot];
+            g_swaps[slot] = SwapRequest{};
+        }
+    }
+    for (int slot = 0; slot < 2; ++slot) {
+        if (!want[slot].pending) continue;
+        Card &c = g_cards[slot];
+        if (c.present) {
+            std::fprintf(stderr, "[mc] slot %d: card %s taken out\n", slot + 1, c.file.c_str());
+            close_card(c);
+        }
+        (slot == 0 ? g_options.memcard_path : g_options.memcard2_path) = want[slot].file;
+        if (want[slot].file.empty()) continue;
+        load_card(slot, want[slot].file);
+        // the game must see the slot empty before the new card is there (else mcman would go on with what it knows of the old one)
+        std::lock_guard<std::mutex> hold(c.lock);
+        c.absent_left = 4;
+        c.absent_until = ps2::frames_run() + 60;
+    }
+}
+
+}
+
+// every frame: the file is written 50 frames after the card was last changed (a game writes it in many small steps); a card swap
+// the host asked for is done here
 void flush_cards() {
-    Card &c = g_card;
-    test_hook(c);
-    if (!c.dirty || c.quiet.fetch_add(1) + 1 < 50) return;
-    write_card(false);
+    // PS2_TEST_CARD_SWAP=<frame>:<slot 1|2>:<file> (tests only): asks for a swap at that frame, as the quick menu's card library does
+    static const std::string swap_spec = os::env("PS2_TEST_CARD_SWAP");
+    if (!swap_spec.empty()) {
+        const std::size_t a = swap_spec.find(':'), b = a == std::string::npos ? a : swap_spec.find(':', a + 1);
+        if (b != std::string::npos && ps2::frames_run() == std::strtoull(swap_spec.c_str(), nullptr, 10)) {
+            std::string why;
+            const int slot = std::atoi(swap_spec.c_str() + a + 1) - 1;
+            const bool ok = request_swap(slot, swap_spec.substr(b + 1), &why);
+            std::fprintf(stderr, "[mc] test: swap slot %d at frame %llu: %s\n", slot + 1, static_cast<unsigned long long>(ps2::frames_run()), ok ? "asked" : why.c_str());
+        }
+    }
+    bool any = false;
+    {
+        std::lock_guard<std::mutex> hold(g_swap_lock);
+        any = g_swaps[0].pending || g_swaps[1].pending;
+    }
+    if (any) do_swaps();
+    for (Card &c : g_cards) {
+        test_hook(c);
+        if (!c.dirty || c.quiet.fetch_add(1) + 1 < 50) continue;
+        write_card(c, false);
+    }
 }
 
 // the end of the run (the window was closed, the frame limit was reached, the game stopped, Ctrl+C): the card file is written now
 // if the card changed after the last write
 void flush_cards_now(bool hurry) {
-    write_card(hurry);
-    Card &c = g_card;
-    const std::uint64_t used = c.reads + c.writes + c.erases;
-    if (!hurry && used != c.reported) {  // what the game did with the card, so a log tells at a glance whether it ever saved
-        c.reported = used;
-        std::fprintf(stderr, "[mc] card use so far: %llu page reads, %llu page writes, %llu block erases\n", static_cast<unsigned long long>(c.reads),
-                     static_cast<unsigned long long>(c.writes), static_cast<unsigned long long>(c.erases));
+    for (Card &c : g_cards) {
+        write_card(c, hurry);
+        const std::uint64_t used = c.reads + c.writes + c.erases;
+        if (!hurry && used != c.reported) {  // what the game did with the card, so a log tells at a glance whether it ever saved
+            c.reported = used;
+            std::fprintf(stderr, "[mc] card %s use so far: %llu page reads, %llu page writes, %llu block erases\n", c.file.c_str(),
+                         static_cast<unsigned long long>(c.reads), static_cast<unsigned long long>(c.writes), static_cast<unsigned long long>(c.erases));
+        }
     }
 }
 
@@ -833,8 +956,9 @@ void flush_cards_now(bool hurry) {
 // middle of a page), and nothing is written without it. Nothing is printed here (the crashed thread may hold the lock of stderr):
 // returns 0 when the card had not changed, 1 when the copy was written (`where` is its name), 2 when the card was busy, 3 when
 // the copy could not be written.
-int save_card_after_crash(const char **where) {
-    Card &c = g_card;
+int save_card_after_crash(const char **where, int slot) {
+    if (slot < 0 || slot > 1) return 0;
+    Card &c = g_cards[slot];
     if (!c.present || !c.dirty || c.crash_file.empty()) return 0;
     std::unique_lock<std::mutex> hold(c.lock, std::defer_lock);
     for (int i = 0; i < 100 && !hold.try_lock(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -846,15 +970,95 @@ int save_card_after_crash(const char **where) {
 
 // A copy of the card as the game sees it now: the file is written 50 frames after a change, so it can be behind. With wait false the
 // card is given up after a moment when a card command holds it (the report of a hanging game must not hang too).
-bool card_image(std::vector<std::uint8_t> &out, bool wait) {
-    Card &c = g_card;
+bool card_image(std::vector<std::uint8_t> &out, bool wait, int slot) {
+    if (slot < 0 || slot > 1) return false;
+    Card &c = g_cards[slot];
     if (!c.present) return false;
     std::unique_lock<std::mutex> hold(c.lock, std::defer_lock);
     if (wait) hold.lock();
     else
         for (int i = 0; i < 40 && !hold.try_lock(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    if (!hold.owns_lock()) return false;
+    if (!hold.owns_lock() || !c.present) return false;
     out = c.data;
+    return true;
+}
+
+bool request_swap(int slot, const std::string &file, std::string *why) {
+    if (slot < 0 || slot > 1) return false;
+    if (card_busy(g_cards[slot])) {
+        if (why) *why = "the game used the card in slot " + std::to_string(slot + 1) + " a moment ago";
+        return false;
+    }
+    const Card &other = g_cards[1 - slot];
+    if (!file.empty() && other.present && same_file(other.file, file)) {
+        if (why) *why = "that card is in slot " + std::to_string(2 - slot);
+        return false;
+    }
+    std::lock_guard<std::mutex> hold(g_swap_lock);
+    if (!file.empty() && g_swaps[1 - slot].pending && same_file(g_swaps[1 - slot].file, file)) {
+        if (why) *why = "that card is going into slot " + std::to_string(2 - slot);
+        return false;
+    }
+    g_swaps[slot].pending = true;
+    g_swaps[slot].file = file;
+    return true;
+}
+
+std::string card_file(int slot) {
+    if (slot < 0 || slot > 1) return {};
+    {
+        std::lock_guard<std::mutex> hold(g_swap_lock);
+        if (g_swaps[slot].pending) return g_swaps[slot].file;
+    }
+    std::lock_guard<std::mutex> hold(g_cards[slot].lock);
+    return g_cards[slot].present ? g_cards[slot].file : std::string();
+}
+
+bool card_busy(int slot) { return slot >= 0 && slot < 2 && card_busy(g_cards[slot]); }
+
+// Renames the card file in `slot` (and its backups folder and the copies in it) while it stays in: the card is written first, the
+// lock file moves too.
+bool rename_card(int slot, const std::string &to, std::string *why) {
+    namespace fs = std::filesystem;
+    if (slot < 0 || slot > 1) return false;
+    Card &c = g_cards[slot];
+    write_card(c, false);
+    std::lock_guard<std::mutex> hold(c.lock);
+    if (!c.present || c.file.empty()) {
+        if (why) *why = "no card in that slot";
+        return false;
+    }
+    std::error_code error;
+    if (fs::exists(os::path(to), error)) {
+        if (why) *why = "a card of that name is there already";
+        return false;
+    }
+    std::string reason;
+    if (fs::exists(os::path(c.file), error) && !os::move_replacing(c.file, to, &reason)) {
+        if (why) *why = reason;
+        return false;
+    }
+    const std::string old_prefix = os::utf8(os::path(c.file).stem()) + "_", new_prefix = os::utf8(os::path(to).stem()) + "_";
+    const fs::path old_backups = backups_dir(c.file), new_backups = backups_dir(to);
+    if (fs::exists(old_backups, error)) {
+        fs::rename(old_backups, new_backups, error);
+        std::vector<fs::path> inside;
+        for (fs::directory_iterator it(new_backups, error), end; !error && it != end; it.increment(error)) inside.push_back(it->path());
+        for (const fs::path &p : inside) {  // list_backups looks for "<name>_..." files: the copies take the new name too
+            const std::string name = os::utf8(p.filename());
+            if (name.rfind(old_prefix, 0) != 0) continue;
+            std::error_code e2;
+            fs::rename(p, new_backups / os::path(new_prefix + name.substr(old_prefix.size())), e2);
+        }
+    }
+    c.owner.release();
+    fs::remove(os::path(c.file + ".lock"), error);
+    bool busy = false;
+    c.owner.take(to + ".lock", busy, reason);
+    std::fprintf(stderr, "[mc] slot %d: card %s renamed to %s\n", slot + 1, c.file.c_str(), to.c_str());
+    c.file = to;
+    c.crash_file = beside(to, "crash");
+    (slot == 0 ? g_options.memcard_path : g_options.memcard2_path) = to;
     return true;
 }
 
@@ -954,8 +1158,15 @@ void state(ps2::state::Stream &s) {
         }
     }
     s.pod(g_dma);
-    s.size(g_card.address);
-    s.pod(g_card.term);
+    s.size(g_cards[0].address);
+    s.pod(g_cards[0].term);
+    if (s.version() >= 12) {  // 12 adds slot 2 (an older state: its address and terminator start over)
+        s.size(g_cards[1].address);
+        s.pod(g_cards[1].term);
+    } else if (s.loading()) {
+        g_cards[1].address = 0;
+        g_cards[1].term = 0x55;
+    }
 }
 
 }
@@ -966,9 +1177,14 @@ namespace ps2 {
 // (after the emulation returns, when the window is closed, on Ctrl+C or a crash with hurry set) so that a save is never lost.
 void flush_memory_card(bool hurry) { iop::sio2::flush_cards_now(hurry); }
 
-bool memory_card_image(std::vector<std::uint8_t> &out, bool wait) { return iop::sio2::card_image(out, wait); }
+bool memory_card_image(std::vector<std::uint8_t> &out, bool wait, int slot) { return iop::sio2::card_image(out, wait, slot); }
+
+bool swap_memory_card(int slot, const std::string &file, std::string *why) { return iop::sio2::request_swap(slot, file, why); }
+std::string memory_card_file(int slot) { return iop::sio2::card_file(slot); }
+bool memory_card_busy(int slot) { return iop::sio2::card_busy(slot); }
+bool rename_memory_card(int slot, const std::string &to, std::string *why) { return iop::sio2::rename_card(slot, to, why); }
 
 // The crash path of the host (host/main.cpp declares it; see save_card_after_crash above for what it does and returns).
-int save_memory_card_after_crash(const char **where) { return iop::sio2::save_card_after_crash(where); }
+int save_memory_card_after_crash(const char **where, int slot) { return iop::sio2::save_card_after_crash(where, slot); }
 
 }

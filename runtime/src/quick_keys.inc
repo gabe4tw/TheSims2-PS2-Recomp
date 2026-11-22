@@ -21,6 +21,8 @@ constexpr unsigned kSave = 1, kLoad = 2, kReport = 4, kHang = 8;  // kHang: only
 constexpr std::int64_t kGiveUpMs = 4000;         // a request the emulation has not answered in this time is dropped (the game hangs)
 
 std::atomic<unsigned> g_requests{0};
+// local change: the quick menu's save state slots (1 to 10, states/slot_<n>.state); 0 is the plain quick save / newest quick load
+std::atomic<int> g_slot{0};
 std::atomic<std::int64_t> g_asked_at{0};         // when the oldest unanswered request was made
 const Clock::time_point g_started = Clock::now();
 std::size_t g_size_hint = 48u << 20;             // size of the last state, so the next one does not grow its buffer step by step
@@ -540,6 +542,7 @@ void prune() {
     for (std::size_t i = 0; i + kKeepQuick < all.size(); ++i) {
         fs::remove(all[i], error);
         fs::remove(with_suffix(all[i], ".ps2"), error);
+        fs::remove(with_suffix(all[i], ".slot2.ps2"), error);
         fs::remove(with_suffix(all[i], ".inputs"), error);
         fs::remove(with_suffix(all[i], ".prev.inputs"), error);
         fs::remove(with_suffix(all[i], ".inputs.ps2"), error);
@@ -574,15 +577,20 @@ bool looks_like_state(const std::vector<std::uint8_t> &data) {
 // changes the card: a player who goes back to an older state must keep the saves made since. This says so in the log when the
 // card in use differs from the copy, and returns a short text for the window (empty when they are the same or there is no copy).
 std::string card_note(const fs::path &state_file) {
-    if (g_options.memcard_path.empty()) return {};
-    const fs::path copy = with_suffix(state_file, ".ps2");
-    std::vector<std::uint8_t> saved, current;
-    if (!read_whole(copy, saved) || !memory_card_image(current, true)) return {};
-    if (saved == current) return {};
-    std::fprintf(stderr, "[state] note: the memory card is not the one that was in use when %s was saved.\n", os::utf8(state_file.filename()).c_str());
-    std::fprintf(stderr, "[state]       The card was not changed, so saves made since then stay on it. To go back to the card of that\n");
-    std::fprintf(stderr, "[state]       moment, close the game and copy %s over %s.\n", os::utf8(copy).c_str(), g_options.memcard_path.c_str());
-    return "memory card left as it is";
+    bool differs = false;
+    for (int slot = 0; slot < 2; ++slot) {
+        const std::string &card = slot == 0 ? g_options.memcard_path : g_options.memcard2_path;
+        if (card.empty()) continue;
+        const fs::path copy = with_suffix(state_file, slot == 0 ? ".ps2" : ".slot2.ps2");
+        std::vector<std::uint8_t> saved, current;
+        if (!read_whole(copy, saved) || !memory_card_image(current, true, slot)) continue;
+        if (saved == current) continue;
+        differs = true;
+        std::fprintf(stderr, "[state] note: the memory card in slot %d is not the one that was in use when %s was saved.\n", slot + 1, os::utf8(state_file.filename()).c_str());
+        std::fprintf(stderr, "[state]       The card was not changed, so saves made since then stay on it. To go back to the card of that\n");
+        std::fprintf(stderr, "[state]       moment, close the game and copy %s over %s.\n", os::utf8(copy).c_str(), card.c_str());
+    }
+    return differs ? "memory card left as it is" : std::string();
 }
 
 void save() {
@@ -606,30 +614,37 @@ void save() {
     case Serialized::done: break;
     }
     g_tries[0] = 0;
-    const std::string name = unique_name(dir, "quick_" + stamp() + "_" + frame_text());
-    std::vector<std::uint8_t> card;
+    const int slot = g_slot.exchange(0);
+    const std::string name = slot > 0 ? "slot_" + std::to_string(slot) : unique_name(dir, "quick_" + stamp() + "_" + frame_text());
+    std::vector<std::uint8_t> card, card2;
     const bool has_card = memory_card_image(card, true);
+    const bool has_card2 = memory_card_image(card2, true, 1);
     const fs::path file = dir / (name + ".state");
     record_for_state(file, CardAt::state);  // the pad recording of the time after this save; its card is the copy beside the save
-    worker().post([file, bytes = std::move(w.out), card = std::move(card), has_card]() {
+    worker().post([file, bytes = std::move(w.out), card = std::move(card), has_card, card2 = std::move(card2), has_card2, slot]() {
         std::string why;
         if (!write_whole(file, bytes.data(), bytes.size(), why)) {
             notice(4, "Could not save (F5): " + why);
             return;
         }
         if (has_card && !write_whole(with_suffix(file, ".ps2"), card.data(), card.size(), why)) std::fprintf(stderr, "[keys] the card copy was not written: %s\n", why.c_str());
+        std::error_code stale;
+        if (has_card2 && !write_whole(with_suffix(file, ".slot2.ps2"), card2.data(), card2.size(), why)) std::fprintf(stderr, "[keys] the slot 2 card copy was not written: %s\n", why.c_str());
+        else if (!has_card2) fs::remove(with_suffix(file, ".slot2.ps2"), stale);  // a slot saved over: no copy of an earlier card
         prune();
         std::fprintf(stderr, "[state] quick save %s (%s)\n", os::utf8(file).c_str(), megabytes(bytes.size()).c_str());
-        notice(1, "Saved (F5)");
+        notice(1, slot > 0 ? "Saved in slot " + std::to_string(slot) : std::string("Saved (F5)"));
     });
 }
 
 // The window thread plays the audio queue, which still holds the sound from before the load; it clears it when it sees the notice.
 void load() {
     worker().drain(10000);  // a save made a moment ago must be in the folder
-    const std::vector<fs::path> all = quick_states();
-    if (all.empty()) {
-        notice(4, "No quick save yet. Press F5 to make one.");
+    const int slot = g_slot.exchange(0);
+    const std::vector<fs::path> all = slot > 0 ? std::vector<fs::path>{states_dir() / ("slot_" + std::to_string(slot) + ".state")} : quick_states();
+    std::error_code exists_error;
+    if (all.empty() || (slot > 0 && !fs::exists(all.back(), exists_error))) {
+        notice(4, slot > 0 ? "Slot " + std::to_string(slot) + " is empty" : std::string("No quick save yet. Press F5 to make one."));
         return;
     }
     const fs::path file = all.back();
@@ -662,7 +677,8 @@ void load() {
     record_for_state(file, CardAt::own);  // a new recording from this state; the card is the one in use now, not the copy beside the state
     std::fprintf(stderr, "[state] quick load %s (frame %llu)\n", os::utf8(file).c_str(), static_cast<unsigned long long>(g_frames));
     const std::string note = card_note(file);
-    notice(2, note.empty() ? "Loaded (F8)" : "Loaded (F8) - " + note);
+    const std::string loaded = slot > 0 ? "Loaded slot " + std::to_string(slot) : std::string("Loaded (F8)");
+    notice(2, note.empty() ? loaded : loaded + " - " + note);
 }
 
 // ---- the picture of a report ----
@@ -1051,6 +1067,14 @@ bool replay_begin() {
                  static_cast<unsigned long long>(r.end), r.checks.size());
     return true;
 }
+
+// local change: a save state slot of the quick menu (1 to 10)
+void slot_request(QuickKey key, int slot) {
+    quick::g_slot.store(std::clamp(slot, 1, 10));
+    quick_request(key);
+}
+
+std::string slot_file(int slot) { return os::utf8(quick::states_dir() / ("slot_" + std::to_string(slot) + ".state")); }
 
 void quick_request(QuickKey key) {
     unsigned bit = quick::kSave;

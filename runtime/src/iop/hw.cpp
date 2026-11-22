@@ -4,6 +4,7 @@
 #include "kernel.hpp"
 #include "sio2.hpp"
 #include "spu2.hpp"
+#include "usb.hpp"
 
 #include "ps2/state.hpp"
 
@@ -162,6 +163,7 @@ void reset() {
     spu2::reset();
     sio2::reset();
     std::memset(g_ohci, 0, sizeof g_ohci);
+    usb::reset();
 }
 
 void soft_reset() {
@@ -169,6 +171,7 @@ void soft_reset() {
     g_ictrl = 1;
     std::memset(g_dma, 0, sizeof g_dma);
     std::memset(g_ohci, 0, sizeof g_ohci);
+    usb::soft_reset();
     spu2::restart_ticks();
 }
 
@@ -298,7 +301,7 @@ void ilink_write(std::uint32_t a, std::uint32_t v) {
 
 std::uint32_t read(std::uint32_t a, unsigned size) {
     if (a >= 0x1F900000u && a < 0x1F900800u) return spu2::read(a, size);
-    if (a >= 0x1F801600u && a < 0x1F801660u) return ohci_read(a);
+    if (a >= 0x1F801600u && a < 0x1F801660u) return usb::on() ? usb::read(a) : ohci_read(a);
     if (a >= 0x1F808200u && a < 0x1F808280u) return sio2::read(a);
     if (a >= kIlink && a < kIlinkEnd) {
         const std::uint32_t v = ilink_read(a & ~3u) >> ((a & 3u) * 8);
@@ -339,7 +342,11 @@ std::uint32_t read(std::uint32_t a, unsigned size) {
 
 void write(std::uint32_t a, std::uint32_t v, unsigned size) {
     if (a >= 0x1F900000u && a < 0x1F900800u) { spu2::write(a, v, size); return; }
-    if (a >= 0x1F801600u && a < 0x1F801660u) { ohci_write(a, v); return; }
+    if (a >= 0x1F801600u && a < 0x1F801660u) {
+        if (usb::on()) usb::write(a, v);
+        else ohci_write(a, v);
+        return;
+    }
     if (a >= 0x1F808200u && a < 0x1F808280u) { sio2::write(a, v); return; }
     if (a >= kIlink && a < kIlinkEnd) {
         report("write", a, v);
@@ -401,6 +408,8 @@ void state(ps2::state::Stream &s) {
     s.pod(g_dma);
     s.pod(g_ohci);
     s.pod(g_scratchpad);
+    if (s.version() >= 11) usb::state(s);
+    if (s.loading()) usb::after_load(g_ohci, s.version() >= 11);  // the USB controller and the camera (an older state has neither)
 }
 
 }

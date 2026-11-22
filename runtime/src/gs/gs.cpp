@@ -24,6 +24,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace ps2::vu { extern std::uint32_t g_trace_vu1_pc; void trace_dump(const char *path); }
@@ -757,6 +759,385 @@ void transfer(const State &s, std::uint64_t dir) {
 
 }
 
+// local change (PS2_UI_SQUEEZE, for a 4:3 game shown 16:9): the game lays its menus and HUD out for a 4:3 screen, so on a 16:9
+// picture they come out a third too wide. A draw counts as interface when it goes to the 640 wide picture and either ignores depth
+// (test off or ALWAYS) or sits at the very front of a 16-bit depth buffer; the 3D scene tests depth (GEQUAL). Such a draw is narrowed
+// (kick() below). Draws that cover the whole screen (fades, backdrops, films) stay as they are.
+//   PS2_UI_SQUEEZE=1    narrow to 75 %, the true 4:3 shape
+//   PS2_UI_SQUEEZE=NN   narrow to NN % (50 to 99): 85 is a little wider than true
+// What a shape is narrowed towards depends on the group of interface shapes it belongs to, so that a HUD in a corner stays in its
+// corner: the screen is a grid of 5 x 5 pixel cells, every interface shape marks the cells its box covers, and once per refresh
+// the cells marked in the last few refreshes are joined into groups of touching cells. Large shapes mark a box 8 pixels smaller
+// on every side, so that two panels that merely touch (a dialog next to a logo) stay two groups; small shapes (letters, icons)
+// mark their whole box and so join the panel they lie on. A group is narrowed towards the left edge when it reaches that edge,
+// ends before the middle of the screen and is a solid block (at least 40 pixels high and 3000 square pixels: a panel, not a
+// line of text); the same for the right edge. All other groups are narrowed towards the middle. A shape takes the group of the
+// cell in the middle of its box, as found one refresh earlier.
+namespace ui_squeeze {
+constexpr int kCell = 5, kCols = 128, kRows = 106;
+std::uint64_t g_stamp[kRows][kCols];
+std::uint8_t g_anchor[kRows][kCols];  // 0 middle, 1 left edge, 2 right edge
+std::uint64_t g_frame = 0;
+
+int percent() {
+    static const int value = [] {
+        const char *e = std::getenv("PS2_UI_SQUEEZE");
+        const int v = e ? std::atoi(e) : 0;
+        return v == 1 ? 75 : (v >= 50 && v <= 99) ? v : 100;
+    }();
+    return value;
+}
+
+// local change: how each group of interface shapes is narrowed, decided once per refresh.
+//  - A solid group that reaches one side edge of the screen and not the other goes to that edge (a HUD in a corner; a queue of
+//    icons that grows out of the opposite corner, however far it reaches).
+//  - A group that reaches both edges is one of two things. When nearly all of it was there a refresh ago, it is pieces that
+//    have grown together (the HUD on the left and the action queue from the right touch while a Sim is busy): every cell keeps
+//    what it had, and new cells take what the nearest old cell has, so nothing moves when they touch or part. Otherwise it is
+//    something new across the whole screen (a catalogue bar) and goes to the middle in one piece.
+//  - A small group (a portrait, an icon, a number next to the HUD) follows the nearest solid group within 80 pixels.
+//  - Everything else goes to the middle (dialogs, menus, lines of text).
+std::uint8_t g_was_live[kRows][kCols];
+std::uint8_t g_was_solid[kRows][kCols];  // the cell was in a solid group at the last refresh with interface shapes
+// The last three refreshes in which the game drew interface shapes. A cell counts as on the screen while it was drawn within six
+// refreshes, or within those three: at 50 refreshes a second and the game's usual 25 pictures that is the same thing, but at a
+// higher frame rate, or in a busy house where the game takes longer over a picture, six refreshes pass between two pictures of the
+// game; the HUD's cells then went stale between them, and it was drawn towards the middle like a thing never seen before.
+std::uint64_t g_active[3] = {};
+
+std::atomic<bool> g_panel_up{false};  // local change (the PC mouse): a full-screen panel was up at the last regroup
+
+void regroup(std::uint64_t frame) {
+    g_panel_up.store(false, std::memory_order_relaxed);
+    static std::uint8_t seen[kRows][kCols];
+    static std::uint8_t before[kRows][kCols];
+    static std::vector<int> cells, queue;
+    struct Group {
+        int first, count, lo, hi, top, bottom;
+        bool solid;
+        std::uint8_t anchor;
+        bool solid_like = false;  // a small group that went to a screen edge by itself
+    };
+    static std::vector<Group> groups;
+    static const bool log = std::getenv("PS2_UI_SQUEEZE_LOG") != nullptr;
+    std::memset(seen, 0, sizeof seen);
+    std::memcpy(before, g_anchor, sizeof before);
+    std::memset(g_anchor, 0, sizeof g_anchor);
+    cells.clear();
+    groups.clear();
+    const auto live = [&](int r, int c) { return g_stamp[r][c] && (g_stamp[r][c] + 6 >= frame || g_stamp[r][c] >= g_active[2]); };
+    for (int r = 0; r < kRows; ++r)
+        for (int c = 0; c < kCols; ++c) {
+            if (seen[r][c] || !live(r, c)) continue;
+            Group g{static_cast<int>(cells.size()), 0, c, c, r, r, false, 0};
+            cells.push_back(r * kCols + c);
+            seen[r][c] = 1;
+            for (std::size_t at = g.first; at < cells.size(); ++at) {
+                const int cr = cells[at] / kCols, cc = cells[at] % kCols;
+                g.lo = std::min(g.lo, cc); g.hi = std::max(g.hi, cc); g.top = std::min(g.top, cr); g.bottom = std::max(g.bottom, cr);
+                for (int dr = -1; dr <= 1; ++dr)
+                    for (int dc = -1; dc <= 1; ++dc) {
+                        const int nr = cr + dr, nc = cc + dc;
+                        if (nr < 0 || nr >= kRows || nc < 0 || nc >= kCols || seen[nr][nc] || !live(nr, nc)) continue;
+                        seen[nr][nc] = 1;
+                        cells.push_back(nr * kCols + nc);
+                    }
+            }
+            g.count = static_cast<int>(cells.size()) - g.first;
+            g.solid = (g.bottom - g.top + 1) * kCell >= 40 && g.count * kCell * kCell >= 3000;
+            // Once solid, a group stays solid while most of it is the same cells. The slider of the body editor is a thin wedge
+            // that grows and shrinks as it is moved, around the size above: solid it went to the middle, small it followed the
+            // panel 70 pixels to its left to the left edge, so it jumped while being dragged.
+            // Only for groups at least half a panel's area: a panel that slides in is one solid group, and when it stops, the
+            // rounded ends of its header and bar (20x20 and 20x40 pixels in create-a-Sim's colour page) come apart from it; kept
+            // solid they went to the middle on their own, half a screen away from their panel at the left edge.
+            if (!g.solid && g.count * kCell * kCell >= 1500) {
+                int old = 0;
+                for (int i = 0; i < g.count; ++i) old += g_was_solid[cells[g.first + i] / kCols][cells[g.first + i] % kCols];
+                g.solid = old * 5 >= g.count * 4;
+            }
+            groups.push_back(g);
+        }
+    // A panel that fills most of the screen (the buy catalogue, the relationships page) is a screen laid out as a whole:
+    // its side rails, its "Help" label and everything else belong where the game put them around it. While one is up,
+    // everything is narrowed towards the middle and nothing goes to the edges; rails at the screen's sides would otherwise
+    // leave the panel, or the catalogue's halves go to opposite edges. Edge anchoring is for the HUD over the game.
+    for (const Group &g : groups) {
+        // (448 wide: the full-screen panels are 530-590 pixels wide; dialogs and the main menu's wheel are ~370 and must not
+        // send the "Die Sims 2" logo and the HUD towards the middle when they open)
+        if (!g.solid || (g.hi - g.lo + 1) * kCell < 448 || (g.bottom - g.top + 1) * kCell < 224) continue;
+        if (log) {
+            static std::uint64_t said = 0;
+            if (frame > said + 60 || frame % 120 == 0) std::fprintf(stderr, "[ui] frame %llu: a panel fills the screen (x %d-%d y %d-%d): everything to the middle\n", static_cast<unsigned long long>(frame), g.lo * kCell, (g.hi + 1) * kCell, g.top * kCell, (g.bottom + 1) * kCell);
+            said = frame;
+        }
+        for (int r = 0; r < kRows; ++r)
+            for (int c = 0; c < kCols; ++c) g_was_live[r][c] = g_was_solid[r][c] = 0;  // (afterwards the HUD is placed afresh)
+        g_panel_up.store(true, std::memory_order_relaxed);
+        return;
+    }
+    // "At an edge" is not enough for a wide group: the pause menu's bar runs from 55 to 565 of the 640 pixels and is in the
+    // middle, though its glow comes within 70 pixels of the left edge on some frames. A group goes to an edge only when it is
+    // clearly nearer to it: the gap on the other side is more than twice the gap on this side plus 100 pixels.
+    const auto gap_left = [](const Group &g) { return g.lo * kCell; };
+    const auto gap_right = [](const Group &g) { return 640 - (g.hi + 1) * kCell; };
+    const auto both = [&](const Group &g) { return gap_left(g) < 70 && gap_right(g) < 70; };
+    const auto left = [&](const Group &g) { return gap_left(g) < 70 && (both(g) || gap_right(g) > 2 * gap_left(g) + 100); };
+    const auto right = [&](const Group &g) { return gap_right(g) < 70 && (both(g) || gap_left(g) > 2 * gap_right(g) + 100); };
+    // solid groups first
+    for (Group &g : groups) {
+        if (!g.solid) continue;
+        if (left(g) != right(g)) {
+            g.anchor = left(g) ? 1 : 2;
+            for (int i = 0; i < g.count; ++i) g_anchor[cells[g.first + i] / kCols][cells[g.first + i] % kCols] = g.anchor;
+            continue;
+        }
+        if (!left(g)) continue;  // reaches neither edge: the middle
+        // reaches both edges
+        int old = 0;
+        for (int i = 0; i < g.count; ++i) old += g_was_live[cells[g.first + i] / kCols][cells[g.first + i] % kCols];
+        g.anchor = 3;  // mixed (for the small groups below: they look at the cells)
+        if (old * 5 < g.count * 4) {
+            g.anchor = 0;
+            if (log) std::fprintf(stderr, "[ui] frame %llu: new group across the screen, y %d-%d, %d cells (%d old): the middle\n", static_cast<unsigned long long>(frame), g.top * kCell, (g.bottom + 1) * kCell, g.count, old);
+            continue;
+        }
+        // old cells keep theirs; new cells take the nearest old cell's (a walk outwards from the old cells, inside the group)
+        queue.clear();
+        std::memset(seen, 0, sizeof seen);  // (free again: the groups are found)
+        for (int i = 0; i < g.count; ++i) {
+            const int cell = cells[g.first + i], cr = cell / kCols, cc = cell % kCols;
+            if (!g_was_live[cr][cc]) continue;
+            g_anchor[cr][cc] = before[cr][cc];
+            seen[cr][cc] = 1;
+            queue.push_back(cell);
+        }
+        for (int i = 0; i < g.count; ++i) seen[cells[g.first + i] / kCols][cells[g.first + i] % kCols] |= 2;  // in this group
+        for (std::size_t at = 0; at < queue.size(); ++at) {
+            const int cr = queue[at] / kCols, cc = queue[at] % kCols;
+            for (int dr = -1; dr <= 1; ++dr)
+                for (int dc = -1; dc <= 1; ++dc) {
+                    const int nr = cr + dr, nc = cc + dc;
+                    if (nr < 0 || nr >= kRows || nc < 0 || nc >= kCols || seen[nr][nc] != 2) continue;
+                    seen[nr][nc] = 3;
+                    g_anchor[nr][nc] = g_anchor[cr][cc];
+                    queue.push_back(nr * kCols + nc);
+                }
+        }
+    }
+    // small groups follow the nearest solid group within 80 pixels (measured between their boxes); one at a screen edge that
+    // has no such neighbour goes to that edge when it is more than a speck
+    for (Group &g : groups) {
+        if (g.solid) continue;
+        int best = 80 / kCell + 1;
+        const Group *near = nullptr;
+        for (const Group &o : groups) {
+            if (!o.solid) continue;
+            const int dx = std::max(0, std::max(o.lo - g.hi, g.lo - o.hi)), dy = std::max(0, std::max(o.top - g.bottom, g.top - o.bottom));
+            const int d = std::max(dx, dy);
+            if (d < best) best = d, near = &o;
+        }
+        std::uint8_t anchor = 0;
+        if (near && near->anchor == 3) {
+            // a mixed group: what its cell nearest to this group's middle has
+            const int mr = (g.top + g.bottom) / 2, mc = (g.lo + g.hi) / 2;
+            int closest = 1 << 30;
+            for (int i = 0; i < near->count; ++i) {
+                const int cell = cells[near->first + i], d = std::abs(cell / kCols - mr) + std::abs(cell % kCols - mc);
+                if (d < closest) closest = d, anchor = g_anchor[cell / kCols][cell % kCols];
+            }
+        } else if (near) {
+            anchor = near->anchor;
+        } else if (g.count >= 20 && left(g) != right(g)) {
+            anchor = left(g) ? 1 : 2;
+            g.solid_like = true;
+        }
+        g.anchor = anchor;
+        if (anchor) for (int i = 0; i < g.count; ++i) g_anchor[cells[g.first + i] / kCols][cells[g.first + i] % kCols] = anchor;
+    }
+    // and a small group with no solid neighbour follows a small one that went to an edge by itself, within 80 pixels: the word
+    // "Help" beside its button in the corner of the screen
+    for (Group &g : groups) {
+        if (g.solid || g.solid_like || g.anchor) continue;
+        int best = 80 / kCell + 1;
+        const Group *near = nullptr;
+        for (const Group &o : groups) {
+            if (!o.solid && !o.solid_like) continue;
+            const int dx = std::max(0, std::max(o.lo - g.hi, g.lo - o.hi)), dy = std::max(0, std::max(o.top - g.bottom, g.top - o.bottom));
+            const int d = std::max(dx, dy);
+            if (d < best) best = d, near = &o;
+        }
+        if (!near || near->solid || !near->anchor) continue;  // (a solid neighbour was looked at above)
+        g.anchor = near->anchor;
+        for (int i = 0; i < g.count; ++i) g_anchor[cells[g.first + i] / kCols][cells[g.first + i] % kCols] = g.anchor;
+    }
+    if (log) {
+        static std::string last;
+        std::string now;
+        char text[96];
+        for (const Group &g : groups) {
+            if (!g.solid) continue;
+            std::snprintf(text, sizeof text, " [x %d-%d y %d-%d: %d]", g.lo * kCell, (g.hi + 1) * kCell, g.top * kCell, (g.bottom + 1) * kCell, g.anchor);
+            now += text;
+        }
+        if (now != last) std::fprintf(stderr, "[ui] frame %llu solid groups:%s\n", static_cast<unsigned long long>(frame), now.c_str());
+        last = now;
+    }
+    for (int r = 0; r < kRows; ++r)
+        for (int c = 0; c < kCols; ++c) g_was_live[r][c] = live(r, c);
+    std::memset(g_was_solid, 0, sizeof g_was_solid);
+    for (const Group &g : groups)
+        if (g.solid)
+            for (int i = 0; i < g.count; ++i) g_was_solid[cells[g.first + i] / kCols][cells[g.first + i] % kCols] = 1;
+}
+
+// local change: the anchor that every anchored cell under a box (pixels) has, 0 when there is none or they differ
+int area_anchor(int x0, int y0, int x1, int y1) {
+    const int c0 = std::clamp(x0 / kCell, 0, kCols - 1), c1 = std::clamp(x1 / kCell, 0, kCols - 1);
+    const int r0 = std::clamp(y0 / kCell, 0, kRows - 1), r1 = std::clamp(y1 / kCell, 0, kRows - 1);
+    int found = 0;
+    for (int r = r0; r <= r1; ++r)
+        for (int c = c0; c <= c1; ++c) {
+            const int a = g_anchor[r][c];
+            if (!a) continue;
+            if (found && a != found) return 0;
+            found = a;
+        }
+    return found;
+}
+
+// Marks the box (pixels) of an interface shape and returns what to narrow it towards.
+int note(int x0, int y0, int x1, int y1, bool visible) {
+    const std::uint64_t frame = ps2::frames_run() + 1;
+    if (frame != g_frame) {
+        regroup(frame);
+        g_active[2] = g_active[1], g_active[1] = g_active[0], g_active[0] = frame;
+        g_frame = frame;
+    }
+    const int mx = (x0 + x1) / 2, my = (y0 + y1) / 2;
+    int bx0 = x0, bx1 = x1, by0 = y0, by1 = y1;
+    if (x1 - x0 >= 24 && y1 - y0 >= 24) {
+        bx0 += 8; bx1 -= 8; by0 += 8; by1 -= 8;
+    }
+    // A shape that cannot be seen (all its corners fully transparent) is no piece of anything: it marks nothing, or it would
+    // join what it covers into one group. (Large shapes do mark: the buy catalogue's backing panel is what makes the whole
+    // catalogue one group, and without it the catalogue's left and right parts went to opposite edges of the screen.)
+    if (visible && bx1 >= 0 && bx0 < kCols * kCell && by1 >= 0 && by0 < kRows * kCell) {
+        const int c0 = std::clamp(bx0 / kCell, 0, kCols - 1), c1 = std::clamp(bx1 / kCell, 0, kCols - 1);
+        const int r0 = std::clamp(by0 / kCell, 0, kRows - 1), r1 = std::clamp(by1 / kCell, 0, kRows - 1);
+        for (int r = r0; r <= r1; ++r)
+            for (int c = c0; c <= c1; ++c) g_stamp[r][c] = frame;
+    }
+    const int anchor = g_anchor[std::clamp(my / kCell, 0, kRows - 1)][std::clamp(mx / kCell, 0, kCols - 1)];
+    // PS2_UI_SQUEEZE_TRACE=x0,y0,x1,y1: every interface shape whose box meets that box (console pixels), with what it was given
+    static int trace[4] = {-1, -1, -1, -1};
+    static const bool tracing = [] {
+        const char *e = std::getenv("PS2_UI_SQUEEZE_TRACE");
+        return e && std::sscanf(e, "%d,%d,%d,%d", &trace[0], &trace[1], &trace[2], &trace[3]) == 4;
+    }();
+    if (tracing && x1 >= trace[0] && x0 <= trace[2] && y1 >= trace[1] && y0 <= trace[3])
+        std::fprintf(stderr, "[ui] frame %llu shape x %d-%d y %d-%d %s -> anchor %d\n", static_cast<unsigned long long>(frame), x0, x1, y0, y1, visible ? "visible" : "invisible", anchor);
+    return anchor;
+}
+}
+
+// local change: PS2_TEX_DUMP=<folder> writes every texture the game draws with into that folder, once each, as a 32-bit TGA
+// named <hash>_<width>x<height>.tga. The hash is of the texture's colours as the game would read them (its palette applied), so
+// one picture stored with two palettes gives two files, and the same picture loaded again later gives none. This is the first
+// half of texture replacement: the files are what an upscaler, or a person, makes better versions from.
+// The alpha in the files is the console's (0x80 is opaque), unchanged.
+// A texture is looked at again only when image data has been sent to the GS since it was last hashed.
+namespace texdump {
+std::uint64_t g_uploads = 1;  // counts image transfers to the GS
+
+const std::string &folder() {
+    static const std::string dir = [] {
+        const char *e = std::getenv("PS2_TEX_DUMP");
+        return std::string(e ? e : "");
+    }();
+    return dir;
+}
+
+struct Seen {
+    std::uint64_t uploads = 0;
+};
+std::unordered_map<std::uint64_t, Seen> g_seen;   // by the texture's place and format (TEX0 without the function bits)
+std::unordered_set<std::uint64_t> g_written;      // by the hash of its colours
+
+// The texture of TEX0 `tex0` as RGBA, the way the CPU renderer reads a texel (raster.cpp, texel)
+void decode(const State &s, std::uint64_t tex0, std::uint32_t w, std::uint32_t h, std::vector<std::uint32_t> &out) {
+    const std::uint32_t tbp = static_cast<std::uint32_t>(tex0 & 0x3FFFu), tbw = static_cast<std::uint32_t>((tex0 >> 14) & 0x3Fu), psm = static_cast<std::uint32_t>((tex0 >> 20) & 0x3Fu);
+    const std::uint32_t cpsm = static_cast<std::uint32_t>((tex0 >> 51) & 0xFu), csa = static_cast<std::uint32_t>((tex0 >> 56) & 0x1Fu);
+    const std::uint32_t ta0 = static_cast<std::uint32_t>(s.texa & 0xFFu), ta1 = static_cast<std::uint32_t>((s.texa >> 32) & 0xFFu);
+    const bool aem = (s.texa >> 15) & 1u;
+    const auto expand16 = [&](std::uint32_t v) {
+        const std::uint32_t r = (v & 31u) << 3, g = ((v >> 5) & 31u) << 3, b = ((v >> 10) & 31u) << 3;
+        const std::uint32_t a = (v & 0x8000u) ? ta1 : (aem && !(v & 0x7FFFu)) ? 0u : ta0;
+        return r | g << 8 | b << 16 | a << 24;
+    };
+    out.resize(static_cast<std::size_t>(w) * h);
+    for (std::uint32_t y = 0; y < h; ++y)
+        for (std::uint32_t x = 0; x < w; ++x) {
+            const std::uint32_t raw = read_pixel(psm, tbp, tbw, x, y);
+            std::uint32_t v = raw;
+            switch (psm) {
+            case PSMCT32: break;
+            case PSMCT24: v = (raw & 0xFFFFFFu) | (((aem && !(raw & 0xFFFFFFu)) ? 0u : ta0) << 24); break;
+            case PSMCT16: case PSMCT16S: v = expand16(raw); break;
+            case PSMT8: case PSMT8H: {
+                const std::uint32_t e = s.clut[raw & 255u];
+                v = cpsm == PSMCT32 || cpsm == PSMCT24 ? e : expand16(e);
+                break;
+            }
+            case PSMT4: case PSMT4HL: case PSMT4HH: {
+                const std::uint32_t e = s.clut[((csa & 15u) * 16u + (raw & 15u)) & 511u];
+                v = cpsm == PSMCT32 || cpsm == PSMCT24 ? e : expand16(e);
+                break;
+            }
+            default: break;
+            }
+            out[static_cast<std::size_t>(y) * w + x] = v;
+        }
+}
+
+std::uint64_t hash(const std::vector<std::uint32_t> &pixels, std::uint32_t w, std::uint32_t h) {
+    std::uint64_t value = 1469598103934665603ull ^ (static_cast<std::uint64_t>(w) << 32 | h);
+    for (const std::uint32_t p : pixels) {
+        value ^= p;
+        value *= 1099511628211ull;
+    }
+    return value;
+}
+
+void see(const State &s, const Context &c) {
+    const std::uint64_t key = c.tex0 & ~(7ull << 34) & ~(7ull << 61);  // without TCC, TFX and CLD
+    Seen &seen = g_seen[key];
+    if (seen.uploads == g_uploads) return;
+    seen.uploads = g_uploads;
+    const std::uint32_t w = 1u << ((c.tex0 >> 26) & 0xFu), h = 1u << ((c.tex0 >> 30) & 0xFu);
+    if (w < 8 || h < 8 || w > 1024 || h > 1024) return;
+    static std::vector<std::uint32_t> pixels;
+    decode(s, c.tex0, w, h, pixels);
+    const std::uint64_t id = hash(pixels, w, h);
+    if (!g_written.insert(id).second) return;
+    bool plain = true;  // one colour all over: memory that holds no picture (yet)
+    for (const std::uint32_t p : pixels) plain = plain && p == pixels[0];
+    if (plain) return;
+    char name[64];
+    std::snprintf(name, sizeof name, "/%016llx_%ux%u.tga", static_cast<unsigned long long>(id), w, h);
+    std::FILE *f = os::open(folder() + name, "wb");
+    if (!f) return;
+    const std::uint8_t header[18] = {0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, static_cast<std::uint8_t>(w), static_cast<std::uint8_t>(w >> 8),
+                                     static_cast<std::uint8_t>(h), static_cast<std::uint8_t>(h >> 8), 32, 0x28};  // 32 bits, top row first
+    std::fwrite(header, 1, sizeof header, f);
+    for (const std::uint32_t p : pixels) {
+        const std::uint8_t bgra[4] = {static_cast<std::uint8_t>(p >> 16), static_cast<std::uint8_t>(p >> 8), static_cast<std::uint8_t>(p), static_cast<std::uint8_t>(p >> 24)};
+        std::fwrite(bgra, 1, 4, f);
+    }
+    std::fclose(f);
+}
+}
+
 // Inlined into the PACKED run (write_packed_run): as a call of its own it cost the ship about 0.15 ms of the drawing thread a frame.
 [[gnu::always_inline]] static inline void kick(bool draw) {
     State &s = g_state;
@@ -765,10 +1146,146 @@ void transfer(const State &s, std::uint64_t dir) {
     if (s.count < needed) return;
     if (draw) {
         if (!trace::g_any || trace::draw(s, needed)) {
-            if (cpu_raster()) raster::draw(s, s.queue, needed);
+            // local change (PS2_UI_SQUEEZE, for a 4:3 game shown 16:9): see ui_squeeze above
+            const Vertex *out = s.queue;
+            Vertex narrowed[3];
+            std::uint64_t old_scissor = 0;
+            Context *changed = nullptr;
+            if (!texdump::folder().empty()) {
+                const std::uint64_t mode = s.prmodecont & 1u ? s.prim : (s.prim & 7u) | (s.prmode & ~7ull);
+                if (mode & 0x10u) texdump::see(s, s.ctx[(mode >> 9) & 1u]);  // TME: a textured shape
+            }
+            bool too_small = false;
+            if (s.queue[0].z >= 0xFEF8u) {  // (first, as nearly all of the 3D scene fails it)
+                const std::uint64_t mode = s.prmodecont & 1u ? s.prim : (s.prim & 7u) | (s.prmode & ~7ull);
+                Context &c = s.ctx[(mode >> 9) & 1u];
+                const bool z16 = ((c.zbuf >> 24) & 0xFu) == 0xAu || ((c.zbuf >> 24) & 0xFu) == 0x2u;
+                bool front = z16;
+                for (int i = 0; front && i < needed; ++i) front = s.queue[i].z >= 0xFEF8u;
+                if (((c.frame >> 16) & 0x3Fu) == 10u && front) {  // depth test ALWAYS alone is not enough: the sky backdrop uses it too, at z 1
+                    const int ofx = static_cast<int>(c.xyoffset & 0xFFFFu), ofy = static_cast<int>((c.xyoffset >> 32) & 0xFFFFu);
+                    int x0 = INT32_MAX, x1 = INT32_MIN, y0 = INT32_MAX, y1 = INT32_MIN;
+                    for (int i = 0; i < needed; ++i) {
+                        const int x = static_cast<int>(s.queue[i].x) - ofx, y = static_cast<int>(s.queue[i].y) - ofy;
+                        x0 = std::min(x0, x); x1 = std::max(x1, x); y0 = std::min(y0, y); y1 = std::max(y1, y);
+                    }
+                    // An interface piece whose box holds no console pixel (the console draws a pixel when its whole-numbered
+                    // position is inside the shape) is invisible on the console: the game hides things by shrinking them to
+                    // a fraction of a pixel (a 0.56 pixel square in a dialog's corner, thin slivers beside menu entries).
+                    // Upscaled, the finer samples found them and they showed as specks and thin lines. They are left out.
+                    const auto holds_pixel = [](int a, int b) { return ((a + 15) >> 4) < ((b + 15) >> 4); };  // a whole number in [a, b), 1/16 pixels
+                    too_small = !holds_pixel(x0, x1) || !holds_pixel(y0, y1);
+                    const bool whole = x0 <= 20 * 16 && x1 >= 620 * 16 && y0 <= 20 * 16 && y1 >= 420 * 16;
+                    if (!whole && !too_small && ui_squeeze::percent() < 100) {
+                        const int pct = ui_squeeze::percent();
+                        // the fixed point: the left edge, the middle or the right edge of the screen, by the group the shape is in
+                        bool visible = false;
+                        for (int i = 0; i < needed; ++i) visible = visible || s.queue[i].a > 4;
+                        // The game hides and reveals panels with a stencil: a shape that writes only the picture's alpha bit
+                        // (every colour bit masked off) marks an area, and the panel's pieces are then drawn with the
+                        // destination alpha test, so they show only inside that area. In build mode the buy catalogue's
+                        // frame is still drawn that way, entirely outside its area: nothing of it shows, but its box filled
+                        // the screen. So: the stencil shape itself marks nothing, and a tested shape marks only the part of
+                        // its box that lies inside the last stencil area.
+                        static int mask_x0 = 0, mask_y0 = 0, mask_x1 = 0, mask_y1 = 0;
+                        bool inside_mask = false;  // a tested shape with some of its box inside the stencil area
+                        int bx0 = x0 >> 4, by0 = y0 >> 4, bx1 = x1 >> 4, by1 = y1 >> 4;
+                        // Only the part inside the scissor can show, so only that part counts. The sand of the busy hourglass
+                        // is a strip ~435 pixels wide that slides through the glass, clipped to the glass by the scissor: by
+                        // its whole box its middle was off the screen's right edge, where nothing is anchored, so the sand
+                        // went to the middle (x ~510 of 640) while the glass stayed at the edge, until the strip had slid
+                        // far enough left (~15 frames each time the hourglass appears).
+                        {
+                            const int sx0 = static_cast<int>(c.scissor & 0x7FFu), sx1 = static_cast<int>((c.scissor >> 16) & 0x7FFu);
+                            const int sy0 = static_cast<int>((c.scissor >> 32) & 0x7FFu), sy1 = static_cast<int>((c.scissor >> 48) & 0x7FFu);
+                            const int cx0 = std::max(bx0, sx0), cx1 = std::min(bx1, sx1), cy0 = std::max(by0, sy0), cy1 = std::min(by1, sy1);
+                            if (cx0 <= cx1 && cy0 <= cy1) bx0 = cx0, bx1 = cx1, by0 = cy0, by1 = cy1;
+                        }
+                        if (((c.frame >> 32) & 0x00FFFFFFu) == 0x00FFFFFFu) {
+                            mask_x0 = bx0; mask_y0 = by0; mask_x1 = bx1; mask_y1 = by1;
+                            visible = false;
+                        } else if ((c.test >> 14) & 1u) {
+                            bx0 = std::max(bx0, mask_x0); by0 = std::max(by0, mask_y0); bx1 = std::min(bx1, mask_x1); by1 = std::min(by1, mask_y1);
+                            inside_mask = bx0 < bx1 && by0 < by1;
+                            if (!inside_mask) {
+                                visible = false;
+                                bx0 = x0 >> 4; by0 = y0 >> 4; bx1 = x1 >> 4; by1 = y1 >> 4;
+                            }
+                        }
+                        int anchor = ui_squeeze::note(bx0, by0, bx1, by1, visible);
+                        // A piece drawn with that test goes where its stencil area goes, wherever it is itself. The lists of
+                        // clothes and objects also draw the columns of the pages before and after, to the left and right of the
+                        // area, where the test hides them. Such a column is outside the panel, so by its own place it went to the
+                        // middle of the screen while the area went to the left edge with the panel: it landed inside the area,
+                        // and the pictures of the page before showed over the list or in its empty places.
+                        // local change (the busy hourglass): a tested piece with some of itself inside the area goes where that part
+                        // is (the anchor note() gave the clipped box); only one entirely outside the area follows the stencil. And the
+                        // stencil shape goes where the pieces tested against it went at the last refresh (stencils of the same rows of
+                        // the screen are taken as the same stencil), else where the cells under it agree, else the middle. The
+                        // hourglass's sand is drawn through a stencil strip ~500 pixels wide that slides through the glass: by the
+                        // strip's middle, strip and sand went to the middle of the screen (x ~510 of 640) while the glass stayed at
+                        // the right edge, ~15 frames each time the hourglass appears (user's screenshot, house.state 12377-12391).
+                        static int mask_anchor = 0, mask_band0 = -1, mask_band1 = -1;
+                        static std::uint64_t mask_frame = ~0ull;
+                        struct Band {
+                            int y0, y1, anchor;
+                            std::uint64_t frame;
+                        };
+                        static std::vector<Band> bands;  // a stencil's rows -> where its pieces went, and when
+                        const std::uint64_t now = ps2::frames_run();
+                        if (((c.frame >> 32) & 0x00FFFFFFu) == 0x00FFFFFFu) {
+                            int chosen = -1;
+                            for (const Band &b : bands)
+                                if (b.y0 == by0 && b.y1 == by1 && b.frame + 6 >= now) chosen = b.anchor;
+                            anchor = chosen >= 0 ? chosen : ui_squeeze::area_anchor(bx0, by0, bx1, by1);
+                            mask_anchor = anchor, mask_frame = now, mask_band0 = by0, mask_band1 = by1;
+                        } else if (((c.test >> 14) & 1u) && mask_frame == now) {
+                            if (!inside_mask) anchor = mask_anchor;
+                            else {
+                                bool known = false;
+                                for (Band &b : bands)
+                                    if (b.y0 == mask_band0 && b.y1 == mask_band1) b.anchor = anchor, b.frame = now, known = true;
+                                if (!known) {
+                                    if (bands.size() >= 64) bands.erase(bands.begin());
+                                    bands.push_back({mask_band0, mask_band1, anchor, now});
+                                }
+                            }
+                        }
+                        const int fixed_px = anchor == 1 ? 0 : anchor == 2 ? 640 : 320;
+                        const int fixed = ofx + fixed_px * 16;
+                        for (int i = 0; i < needed; ++i) {
+                            narrowed[i] = s.queue[i];
+                            // Frames and panels are laid out on the console's half-pixel grid (x.5), so that every pixel reads the
+                            // middle of a texel. Narrowed, their edges fell between pixels and single lines of the finer samples
+                            // read the outermost texels of a piece: thin dark lines at the corners of dialog frames. A corner
+                            // that was on that grid goes to the nearest place on it again; text (anywhere between) is left alone.
+                            const int from = static_cast<int>(s.queue[i].x) - fixed;
+                            int to = from * pct / 100;
+                            if (((static_cast<int>(s.queue[i].x) - ofx) & 15) == 8) to = (to >= 0 ? to / 16 : -((-to + 15) / 16)) * 16 + 8;
+                            narrowed[i].x = static_cast<std::uint32_t>(fixed + to);
+                        }
+                        out = narrowed;
+                        const int sx0 = static_cast<int>(c.scissor & 0x7FFu), sx1 = static_cast<int>((c.scissor >> 16) & 0x7FFu);
+                        if (sx0 > 0 || sx1 < 639) {
+                            const int nx0 = fixed_px + (sx0 - fixed_px) * pct / 100, nx1 = fixed_px + (sx1 + 1 - fixed_px) * pct / 100 - 1;
+                            old_scissor = c.scissor;
+                            changed = &c;
+                            c.scissor = (c.scissor & ~0x07FF07FFull) | static_cast<std::uint64_t>(std::clamp(nx0, 0, 2047)) | (static_cast<std::uint64_t>(std::clamp(nx1, 0, 2047)) << 16);
+                            ++g_setup_generation;
+                        }
+                    }
+                }
+            }
+            if (!too_small) {
+                if (cpu_raster()) raster::draw(s, out, needed);
 #ifdef PS2_GPU
-            if (gpu_on()) gpu::draw(s, s.queue, needed);
+                if (gpu_on()) gpu::draw(s, out, needed);
 #endif
+            }
+            if (changed) {
+                changed->scissor = old_scissor;
+                ++g_setup_generation;
+            }
         }
         ++g_primitives;
     }
@@ -888,6 +1405,7 @@ void write(std::uint32_t reg, std::uint64_t value) {
         }
         trace::transfer(s, value);
         s.trxdir = value;
+        ++texdump::g_uploads;
         g_transfer = Transfer{};
         g_carried = 0;
 #ifdef PS2_GPU
@@ -1673,3 +2191,9 @@ void state(ps2::state::Stream &s) {
 }
 
 }
+
+// local change (the PC mouse, host/mouse_pc.cpp): whether a full-screen game panel (catalogue, relationships, family, CAS pages) is
+// up, as the interface squeeze saw it (only while PS2_UI_SQUEEZE is on)
+namespace ps2 {
+bool ui_panel_up() { return gs::ui_squeeze::g_panel_up.load(std::memory_order_relaxed); }
+}  // namespace ps2

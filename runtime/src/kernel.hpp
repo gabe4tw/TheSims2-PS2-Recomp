@@ -20,6 +20,7 @@ void handle_syscall(Cpu &c, std::uint32_t pc);
 void service(Cpu &c);
 bool must_unwind();
 bool in_handler();
+std::uint32_t call_game(Cpu &c, std::uint32_t address, std::uint32_t a0, std::uint32_t a1);  // local change, see kernel.cpp
 bool interruptible();
 int current_thread();
 void on_vblank_start();

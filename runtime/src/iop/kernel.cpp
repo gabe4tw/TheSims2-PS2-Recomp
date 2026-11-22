@@ -664,7 +664,7 @@ void run(std::uint64_t ee_cycles) {
         const bool deliverable = !g_suspended || !running || running->status != kRun;
         while (!g_events.empty() && g_events.top().at <= g_now) {
             const Event due = g_events.top();
-            const bool hardware = due.job.kind == kJobSpuTick || due.job.kind == kJobDmaDone;
+            const bool hardware = due.job.kind == kJobSpuTick || due.job.kind == kJobDmaDone || due.job.kind == kJobUsbFrame;
             if (!deliverable && !hardware) {
                 // Software events wait for CpuResumeIntr; hardware that is independent of interrupts
                 // must not be stuck behind them, or a guest polling SPU2/DMA inside a critical section

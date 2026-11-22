@@ -4,6 +4,7 @@
 #include "load_stats.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -169,8 +170,14 @@ bool open(const std::string &name, std::uint64_t size, Reader reader, Probe prob
 
 bool is_open() { return static_cast<bool>(g_reader); }
 
+static std::atomic<std::uint64_t> g_sectors_read{0};
+std::uint64_t sectors_read() { return g_sectors_read.load(std::memory_order_relaxed); }
+
 bool read(std::uint32_t sector, std::uint32_t count, void *out) {
     if (!g_reader) return false;
+    g_sectors_read.fetch_add(count, std::memory_order_relaxed);
+    // local change: PS2_DISC_LOG=2 prints every read
+    if (static const bool each = os::env("PS2_DISC_LOG") == "2"; each) std::fprintf(stderr, "[disc-read] lsn %u count %u\n", sector, count);
     const cost::Timer time_it(cost::kDisc);
     const std::size_t want = static_cast<std::size_t>(count) * kSector;
     if (cost::g_on) cost::g_disc_bytes += want;

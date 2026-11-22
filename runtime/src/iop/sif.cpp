@@ -14,6 +14,7 @@
 #include <array>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -763,6 +764,19 @@ void def(const char *library, std::uint32_t index, const char *name, std::functi
     });
 }
 
+// local change: PS2_TRACE_RPC=<server id, hex> prints what the EE sends that server of an IOP module and what it answers, as 16-bit words
+// without the zeros at the end (the Sims 2's sound driver multi_streamer is server 12345: a list of commands in, the streams' states out).
+std::uint32_t traced_rpc() {
+    static const std::uint32_t sid = [] { const char *e = std::getenv("PS2_TRACE_RPC"); return e ? static_cast<std::uint32_t>(std::strtoul(e, nullptr, 16)) : 0u; }();
+    return sid;
+}
+void trace_rpc_words(const char *what, const std::uint8_t *data, std::size_t size) {
+    while (size >= 2 && !data[size - 1] && !data[size - 2]) size -= 2;
+    std::fprintf(stderr, "[rpc] frame %llu %s:", static_cast<unsigned long long>(ps2::frames_run()), what);
+    for (std::size_t i = 0; i + 1 < size; i += 2) std::fprintf(stderr, " %04X", static_cast<unsigned>(data[i] | (data[i + 1] << 8)));
+    std::fputc(10, stderr);
+}
+
 // Hands a request to its server: the data into the server's buffer, then the server's function is called with `ret` as its return address.
 void start_request(iop::Cpu &c, iop::kernel::Thread &t, const Request &request, std::uint32_t ret) {
     const std::uint32_t server = request.call.server_data;
@@ -776,6 +790,7 @@ void start_request(iop::Cpu &c, iop::kernel::Thread &t, const Request &request, 
         return;
     }
     const Server &s = *found;
+    if (traced_rpc() && server_id_of_endpoint(server) == traced_rpc() && !request.data.empty()) trace_rpc_words("send", request.data.data(), request.data.size());
     if (s.buf && !request.data.empty()) {
         iop::watch_copy("RPC data", s.buf, 0, static_cast<std::uint32_t>(request.data.size()), 0);
         std::memcpy(iop::ram_ptr(s.buf), request.data.data(), request.data.size());
@@ -809,6 +824,7 @@ void finish_request(iop::Cpu &c, iop::kernel::Thread &t) {
         std::fprintf(stderr, "[sif] reply server 0x%08X fn %u: the function returned 0, no data goes back (recv %u bytes)\n",
                      server_id_of_endpoint(call.server_data), call.rpc_number, call.recv_size);
     }
+    if (traced_rpc() && result && call.recv_size && server_id_of_endpoint(call.server_data) == traced_rpc()) trace_rpc_words("answer", iop::ram_ptr(result), call.recv_size);
     if (call.recv && result && call.recv_size) {
         const std::uint32_t n = fit_copy("SIF RPC reply", call.recv, result, (std::uint64_t{call.recv_size} + 3u) & ~std::uint64_t{3});
         std::memcpy(g_ram + (call.recv & (kRamSize - 1)), iop::ram_ptr(result), n);

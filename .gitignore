@@ -27,6 +27,8 @@ __pycache__/
 
 # PCSX2 patch files (downloaded by scripts/pnach.py fetch into isos/patches/) are never committed.
 *.pnach
+# local change: the remaster's own patch section (no game data) is kept
+!/kit/sims2/remaster.pnach
 
 # Memory cards (they hold game saves), save states and memory dumps of a running game. The README's example
 # `--memcard mygame.ps2` writes the card into the folder it is started from.
@@ -69,3 +71,6 @@ __pycache__/
 
 # Files saved by hand when a download fails (docs/fetch-retry.md); the app's Update keeps them.
 /downloads/
+
+# local change: the launcher's own settings on one PC (where that player's disc image is)
+/launcher.ini

@@ -10,6 +10,12 @@
 #ifdef PS2_WINDOW
 #include "window.hpp"
 #endif
+#include "webcam.hpp"
+#include "card_library.hpp"
+#include "mod_library.hpp"
+#include "remaster_ini.hpp"
+#include "mouse_pc.hpp"
+#include "ps2/game_memory.hpp"
 #ifdef PS2_PROFILE
 #include "profile.hpp"
 #endif
@@ -22,6 +28,7 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <stdexcept>
 #include <string_view>
@@ -103,7 +110,7 @@ std::string disc_serial(const std::string &path) {
 int usage() {
     std::fprintf(stderr,
                  "usage: ps2run [elf] [--arg text]... [--frames n] [--ntsc] [--misses file]\n"
-                 "              [--disc image.iso] [--memcard card.ps2] [--pal | --ntsc] [--trace-syscalls] [--trace-io] [--trace-threads]\n"
+                 "              [--disc image.iso] [--memcard card.ps2] [--memcard2 card2.ps2] [--card-library folder] [--mods folder] [--pal | --ntsc] [--trace-syscalls] [--trace-io] [--trace-threads]\n"
                  "              [--trace-iop] [--trace-iop-hle] [--frames-dir dir] [--frame-every n] [--frame-at n]...\n"
                  "              [--press frame:button[+button][:frames]]... [--window] [--fullscreen]\n"
                  "              [--save-state frame:file] [--load-state file|newest] [--quick-dir dir] [--widescreen] [--patches file]\n"
@@ -382,17 +389,23 @@ LogTee g_log;
 // card, if it changed since the file was last written, goes to "<card>.crash.ps2" beside it. This saves it and puts the line about
 // it into `line` (snprintf only: no allocation, no stream lock), returning the line's length, 0 for none.
 int crash_card_line(char *line, std::size_t size) {
-    const char *where = nullptr;
-    int length = 0;
-    switch (ps2::save_memory_card_after_crash(&where)) {
-    case 1:
-        length = std::snprintf(line, size, "[mc] the card changed less than a second before the crash; that newest card is kept in %s (the card file keeps the last card written normally)\n", where);
-        break;
-    case 2: length = std::snprintf(line, size, "[mc] the card was being changed when the program crashed; the card file keeps the last card written normally\n"); break;
-    case 3: length = std::snprintf(line, size, "[mc] the card changed before the crash, but no copy could be written; the card file keeps the last card written normally\n"); break;
-    default: break;
+    std::size_t used = 0;
+    for (int slot = 0; slot < 2 && used + 1 < size; ++slot) {
+        const char *where = nullptr;
+        char *at = line + used;
+        const std::size_t room = size - used;
+        int length = 0;
+        switch (ps2::save_memory_card_after_crash(&where, slot)) {
+        case 1:
+            length = std::snprintf(at, room, "[mc] the card in slot %d changed less than a second before the crash; that newest card is kept in %s (the card file keeps the last card written normally)\n", slot + 1, where);
+            break;
+        case 2: length = std::snprintf(at, room, "[mc] the card in slot %d was being changed when the program crashed; the card file keeps the last card written normally\n", slot + 1); break;
+        case 3: length = std::snprintf(at, room, "[mc] the card in slot %d changed before the crash, but no copy could be written; the card file keeps the last card written normally\n", slot + 1); break;
+        default: break;
+        }
+        if (length > 0) used += std::min<std::size_t>(static_cast<std::size_t>(length), room - 1);
     }
-    return length < 0 ? 0 : std::min<int>(length, static_cast<int>(size) - 1);
+    return static_cast<int>(used);
 }
 
 #ifdef _WIN32
@@ -428,7 +441,7 @@ void card_helper() {
     }
     if (what == 'h') ps2::flush_memory_card(true);
     else {
-        char line[640];
+        char line[1280];
         const int length = crash_card_line(line, sizeof line);
         if (length > 0) {
             ssize_t ignored = write(2, line, static_cast<std::size_t>(length));
@@ -451,7 +464,7 @@ void after_crash([[maybe_unused]] bool crashed, [[maybe_unused]] const char *rep
     static char all[8192 + 640];
     std::size_t length = 0;
 #ifdef _WIN32
-    char card[640];
+    char card[1280];
     const int card_length = crash_card_line(card, sizeof card);
     if (card_length > 0) {
         DWORD written = 0;
@@ -616,6 +629,7 @@ int main(int argc, char **argv) {
             const std::string a = argv[i];
             if (a == "--window" || a == "--fullscreen") window_run = true;
             else if (a == "--memcard" && i + 1 < argc) ps2::g_options.memcard_path = argv[++i];
+            else if (a == "--memcard2" && i + 1 < argc) ps2::g_options.memcard2_path = argv[++i];
             else if (a == "--quick-dir" && i + 1 < argc) ps2::g_options.quick_dir = argv[++i];
             else if (a == "--disc" && i + 1 < argc) early_disc = argv[++i];
             else if (a == "--game-dir" && i + 1 < argc) early_game_dir = argv[++i];
@@ -644,7 +658,7 @@ int main(int argc, char **argv) {
 #endif
     std::vector<std::string> args{argv[1]};
     [[maybe_unused]] bool window = false, fullscreen = false;
-    std::string load_path, given_game_dir;
+    std::string load_path, given_game_dir, card_library, mods_dir;
     bool no_record = false;
     ps2::g_options.disc_program = from_disc;
     for (int i = 0; i < argc; ++i) {
@@ -675,6 +689,9 @@ int main(int argc, char **argv) {
         else if (a == "--disc" && i + 1 < argc) ps2::g_options.disc_path = argv[++i];
         else if (a == "--game-dir" && i + 1 < argc) given_game_dir = argv[++i];
         else if (a == "--memcard" && i + 1 < argc) ps2::g_options.memcard_path = argv[++i];
+        else if (a == "--memcard2" && i + 1 < argc) ps2::g_options.memcard2_path = argv[++i];
+        else if (a == "--card-library" && i + 1 < argc) card_library = argv[++i];
+        else if (a == "--mods" && i + 1 < argc) mods_dir = argv[++i];  // local change: the launcher's mods (host/mod_library.hpp)
         else if (a == "--trace-iop") ps2::g_options.trace_iop_modules = true;
         else if (a == "--trace-iop-hle") ps2::g_options.trace_iop_hle = true;
         else if (a == "--frames-dir" && i + 1 < argc) ps2::g_options.frames_dir = argv[++i];
@@ -755,6 +772,108 @@ int main(int argc, char **argv) {
     game_dir = game_dir.lexically_normal();
     ps2::g_options.game_dir = ps2::os::utf8(game_dir);
     const std::filesystem::path data_dir = game_dir.empty() ? program_file.parent_path() : game_dir;
+
+    // local change: remaster.ini in the game folder holds the options of the quick menu's lower half (frame rate, interface
+    // shape, loading, controllers), one "PS2_NAME=value" per line. Each becomes an environment variable here, before anything
+    // reads them, unless the variable is already set (a launcher's own setting wins). The window writes the file (host/window.cpp).
+    {
+        // local change (launcher stage 3): the enabled mods of --mods <folder> (its mods.ini; host/mod_library.hpp). Their patches come
+        // after --patches (the higher mod's last, so it wins), their settings before remaster.ini (a mod's setting wins over the file; the
+        // highest mod's wins over the others; a variable set before the start still wins over both), their texture packs for texrep
+        // (runtime/src/gs/gpu/gpu.cpp; PS2_TEX_PACKS, highest first). PS2_MOD_SETTINGS tells the window which settings a mod holds.
+        std::vector<std::pair<std::string, std::string>> tex_packs;  // (pictures, cache), first wins
+        if (mods_dir.empty()) mods_dir = ps2::os::env("PS2_MODS");  // (the launcher's way: a runner without mods support just ignores it)
+        if (!mods_dir.empty()) {
+            mods::Library lib;
+            std::string why;
+            if (!mods::load(mods_dir, lib, &why)) std::fprintf(stderr, "[mods] %s\n", why.c_str());
+            const mods::Plan plan = mods::plan(lib);
+            for (const std::string &file : plan.patch_files)
+                if (!ps2::load_patches(file)) std::fprintf(stderr, "[mods] cannot read %s\n", file.c_str());
+            std::map<std::string, std::string> owners;
+            for (const auto &[name, value] : plan.settings)
+                if (ps2::os::env(name.c_str()).empty()) {
+                    ps2::os::set_env(name.c_str(), value);
+                    owners[name] = plan.setting_owner.at(name);
+                }
+            if (!owners.empty()) ps2::os::set_env("PS2_MOD_SETTINGS", mods::owners_text(owners));
+            tex_packs = plan.texture_packs;
+            std::string list;
+            for (const std::string &n : plan.names) list += (list.empty() ? "" : ", ") + n;
+            std::fprintf(stderr, "[mods] %zu of %zu on%s%s: %zu patch files, %zu settings, %zu texture packs\n", plan.names.size(), lib.mods.size(), list.empty() ? "" : ": ",
+                         list.c_str(), plan.patch_files.size(), owners.size(), plan.texture_packs.size());
+        }
+        // the HD textures (host/hd_pack.hpp: downloaded with the game into textures\hd) after the mods' packs; Settings > Textures switches them
+        {
+            std::error_code none;
+            if (std::filesystem::is_directory(data_dir / "textures" / "hd", none))
+                tex_packs.emplace_back(ps2::os::utf8(data_dir / "textures" / "hd"), ps2::os::utf8(data_dir / "textures" / ".hd-cache"));
+        }
+        if (!tex_packs.empty() && ps2::os::env("PS2_TEX_PACKS").empty()) ps2::os::set_env("PS2_TEX_PACKS", mods::packs_text(tex_packs));
+        const std::string ini = ps2::os::utf8(data_dir / "remaster.ini");
+        ps2::os::set_env("PS2_REMASTER_INI", ini);
+        if (std::FILE *f = ps2::os::open(ini, "rb")) {
+            char line[256];
+            while (std::fgets(line, sizeof line, f)) {
+                std::string text = line;
+                while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' ')) text.pop_back();
+                const std::size_t eq = text.find('=');
+                if (text.rfind("PS2_", 0) != 0 || eq == std::string::npos) continue;
+                const std::string name = text.substr(0, eq), value = text.substr(eq + 1);
+                if (ps2::os::env(name.c_str()).empty() && !value.empty()) ps2::os::set_env(name.c_str(), value);
+            }
+            std::fclose(f);
+            std::fprintf(stderr, "[options] read %s\n", ini.c_str());
+        }
+        // local change: the aspect ratio (the quick menu's Aspect ratio, PS2_ASPECT=43, 169 or 219). 4:3 tells the game the TV is
+        // 4:3 (no --widescreen) and turns the interface squeeze off; 21:9 maps the squeeze (made for 16:9: 75 = true shape) onto the
+        // wider screen (57 = true shape, 100 stays stretched). The game's own picture shape follows through 0x3DB17C (system.cpp).
+        if (const std::string aspect = ps2::os::env("PS2_ASPECT"); aspect == "43" || aspect == "169" || aspect == "219") {
+            ps2::g_options.aspect = aspect == "43" ? 4.0f / 3.0f : aspect == "169" ? 16.0f / 9.0f : 21.0f / 9.0f;
+            ps2::g_options.widescreen = aspect != "43";
+            const int squeeze = std::atoi(ps2::os::env("PS2_UI_SQUEEZE").c_str());
+            const int wide = squeeze == 1 ? 75 : squeeze >= 50 && squeeze <= 100 ? squeeze : 100;
+            if (aspect == "43") ps2::os::set_env("PS2_UI_SQUEEZE", "100");
+            if (aspect == "219") ps2::os::set_env("PS2_UI_SQUEEZE", std::to_string(std::clamp(57 + (wide - 75) * 43 / 25, 50, 100)));
+            std::fprintf(stderr, "[options] aspect ratio %s, interface squeeze %s %%\n", aspect == "43" ? "4:3" : aspect == "169" ? "16:9" : "21:9",
+                         ps2::os::env("PS2_UI_SQUEEZE").c_str());
+        }
+        // local change: the PC mouse (host/mouse_pc.cpp; The Sims 2 only - it acts only where it finds that game's cursor).
+        // PS2_MOUSE_MODE=1 (the default) or 0 (the mouse buttons and mouse_stick of keys.ini, as before)
+        mouse_pc::set_enabled(ps2::os::env("PS2_MOUSE_MODE") != "0" && ps2::os::env("PS2_MOUSE_MODE") != "pad");
+        ps2::set_frame_hook(mouse_pc::frame);
+        // local change: the larger textures (runtime/src/gs/gpu/gpu.cpp, texrep) are used when the game folder has them
+        std::error_code none;
+        if (ps2::os::env("PS2_TEX_PACK").empty() && std::filesystem::is_directory(data_dir / "textures" / "enhanced", none))
+            ps2::os::set_env("PS2_TEX_PACK", ps2::os::utf8(data_dir / "textures" / "enhanced"));
+        // local change: the quick menu's font (host/menu_font.cpp); without it the menu uses its 5 x 8 letters
+        if (ps2::os::env("PS2_MENU_FONT").empty() && std::filesystem::is_regular_file(data_dir / "menu" / "menu.ttf", none))
+            ps2::os::set_env("PS2_MENU_FONT", ps2::os::utf8(data_dir / "menu" / "menu.ttf"));
+        // local change: PS2_WEBCAM (quick menu Settings > Controls > EyeToy camera) plugs a virtual EyeToy into the first USB port,
+        // fed by that webcam (host/webcam.cpp); unset, "none", or a webcam that is not there leaves the port empty as before
+        const std::string camera = webcam::start(ps2::os::env("PS2_WEBCAM"));
+        if (!camera.empty()) std::fprintf(stderr, "[webcam] EyeToy camera: %s\n", camera.c_str());
+        // local change: the memory card library (--card-library <folder>, host/card_library.hpp). The cards of slot 1 and 2 are the
+        // ones remaster.ini names (PS2_CARD1 / PS2_CARD2, the quick menu's "Memory cards" page); the first start copies the --memcard
+        // card into the folder. --memcard / --memcard2 then name the library's files, so the rest of the program sees two plain cards.
+        if (!card_library.empty()) {
+            // states\, reports\ and logs\ stay where they were: beside the launcher's card (quick_keys.inc base_dir), not in the library
+            if (ps2::g_options.quick_dir.empty() && !ps2::g_options.memcard_path.empty())
+                ps2::g_options.quick_dir = ps2::os::utf8(ps2::os::path(ps2::g_options.memcard_path).parent_path());
+            const cardlib::Start start = cardlib::prepare(card_library, ps2::g_options.memcard_path, ps2::os::env("PS2_CARD1"), ps2::os::env("PS2_CARD2"));
+            if (!start.note.empty()) std::fprintf(stderr, "[cards] %s\n", start.note.c_str());
+            ps2::os::set_env("PS2_CARD_LIBRARY", card_library);
+            for (int slot = 0; slot < 2; ++slot) {
+                (slot == 0 ? ps2::g_options.memcard_path : ps2::g_options.memcard2_path) =
+                    start.slot[slot].empty() ? std::string() : cardlib::file_of(card_library, start.slot[slot]);
+                ps2::os::set_env(slot == 0 ? "PS2_CARD1" : "PS2_CARD2", start.slot[slot].empty() ? "none" : start.slot[slot]);
+                std::fprintf(stderr, "[cards] slot %d: %s\n", slot + 1, start.slot[slot].empty() ? "(empty)" : start.slot[slot].c_str());
+            }
+            // a first start's choice goes into remaster.ini (only when it names no cards yet), so the launcher shows the same cards
+            if (remaster::add_card_lines_if_missing(ps2::os::env("PS2_REMASTER_INI"), start.slot[0], start.slot[1]))
+                std::fprintf(stderr, "[cards] the cards of the first start are noted in remaster.ini\n");
+        }
+    }
 
 #ifdef PS2_WINDOW
     // Playing records the vector programs that are not compiled into this build into the vu1 and vu0 folders of the game that

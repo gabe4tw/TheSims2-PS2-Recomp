@@ -1,0 +1,13 @@
+gametitle=The Sims 2 (PAL-M) (SLES-53718) E626181E
+// The remaster's own patch section (this repo). The [50 FPS] and [Widescreen 16:9] sections come from PCSX2's public patch
+// collection (github.com/PCSX2/pcsx2_patches), downloaded at install by scripts/pnach.py fetch: they are not kept here.
+
+[Aspect from memory]
+author=remaster (local)
+description=The game's aspect ratio function (0x3DB168) reads its value from the word at 0x3DB17C (padding after it), which the runner sets for 4:3, 16:9 or 21:9 (PS2_ASPECT). Default there: 16:9. Use instead of [Widescreen 16:9].
+patch=1,EE,003db168,word,3c01003e
+patch=1,EE,003db16c,word,c420b17c
+patch=1,EE,003db170,word,03e00008
+patch=1,EE,003db174,word,00000000
+patch=1,EE,003db178,word,00000000
+patch=1,EE,003db17c,word,3fe38e2a

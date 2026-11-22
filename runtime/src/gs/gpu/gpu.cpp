@@ -3,11 +3,14 @@
 #include "overlay.hpp"
 #include "setup.hpp"
 #include "tiles.hpp"
+#include "../texpack.hpp"  // local change: texture packs found by picture (launcher stage 3)
 #include "ps2/hitch.hpp"
 #include "ps2/os.hpp"
 #include "ps2/system.hpp"
 #include "ps2/video.hpp"
 
+#include <unordered_set>
+#include <filesystem>
 #include <webgpu/webgpu.h>
 #ifndef __EMSCRIPTEN__
 #include <webgpu/wgpu.h>
@@ -49,8 +52,8 @@ namespace ps2::gs::gpu {
 
 namespace {
 
-enum Pipeline { kUpload, kCopyRead, kCopyWrite, kLoadClut, kDisplay, kRaster, kResolve, kSnapshot, kDecode, kPipelines };
-const char *const kEntryPoints[kPipelines] = {"upload", "copy_read", "copy_write", "load_clut", "display", "raster", "resolve", "snapshot", "decode"};
+enum Pipeline { kUpload, kCopyRead, kCopyWrite, kLoadClut, kDisplay, kRaster, kResolve, kSnapshot, kDecode, kAaEdges, kAaWeights, kAaBlend, kPipelines };
+const char *const kEntryPoints[kPipelines] = {"upload", "copy_read", "copy_write", "load_clut", "display", "raster", "resolve", "snapshot", "decode", "aa_edges", "aa_weights", "aa_blend"};
 
 constexpr std::uint32_t kParamStride = 256;
 constexpr std::uint32_t kClutSlots = 2048;
@@ -99,6 +102,13 @@ std::uint32_t g_scale = 1, g_copy_words = 1u << 20, g_field_words = 1u << 19;
 std::uint32_t g_sharp_2d = 1;
 
 std::uint32_t field_base(std::uint32_t field) { return g_copy_words + (field & 1u) * g_field_words; }
+// local change: anti-aliasing (PS2_AA: 0 off, 1 Fast, 2 Quality, 3 Extra; remaster.ini). Fast runs three passes of gs.wgsl (aa_edges,
+// aa_weights, aa_blend) over the field before the present when video option bit 0 is set; their three areas follow the two fields in
+// `scratch` (edges, weights, the result). They are there only when the run starts with Off or Fast (the two switch at once; Quality
+// and Extra are chosen for a whole run).
+std::uint32_t g_aa_mode = 0, g_fine = 1;
+bool g_aa_room = false;
+std::uint32_t aa_base(std::uint32_t n) { return g_copy_words + (2u + n) * g_field_words; }
 
 bool g_timestamps = false;
 std::uint32_t g_vendor_id = 0;  // PCI vendor id of the chosen adapter (0x8086 Intel), 0 when unknown
@@ -984,6 +994,316 @@ bool rendered(const Range &r) {
     return false;
 }
 
+// ---- Texture replacement (local change) ---------------------------------------------------------------------------------------
+// A kept decoded texture can be shown as a larger picture from disk. The decode cache's identities are not the same from run to
+// run, so a texture is known by its content: once it is decoded, its words are read back from the card, hashed (64-bit FNV-1a
+// over width, height and the RGBA words, the name the texture dump gives a file) and looked up among the files of the
+// replacement folder, <hash>_<width>x<height>.tga (32-bit, 2, 4 or 8 times the size each way, the console's alpha: 0x80 opaque).
+// A found picture goes into the kept part of the decoded buffer next to the original, which stays, so switching between the
+// original and the larger textures needs no reloading: plan_decodes hands out the one or the other (texrep::offset_of).
+//   PS2_TEX_PACK=<folder>   the replacement pictures
+//   PS2_TEX_DUMP=<folder>   write every texture that gets decoded there, once, under the name a replacement needs
+//   PS2_TEX_ENHANCED=0      start with the original textures (ps2::set_textures_enhanced switches while the game runs)
+// While either folder is set every uploaded texture is decoded and kept, also the small and the rarely drawn ones that are
+// otherwise read in place, or they could not be replaced.
+struct Kept;
+namespace texrep {
+std::atomic<bool> g_enhanced{true};
+struct Pending {
+    std::uint32_t at;
+    std::uint64_t ident, serial;
+    std::uint64_t name;  // the place-free number of texture and palette together, 0 when not known: the key of g_known
+};
+std::vector<Pending> g_pending;
+// local change: one read-back pass of process(), the textures it names (see process)
+struct Job {
+    Pending p;
+    std::uint32_t w, h, tw, th, at_words;  // at_words: where its words are in `words`, ~0 when it needs none
+    std::uint64_t id;
+    bool waited = false;  // local change: it waited for a texture pack's answer (its kept texture has big_state 4)
+};
+std::vector<Job> g_flight;            // the jobs of the pass in flight
+std::vector<Job> g_waiting;           // local change: named textures waiting for a texture pack's answer (launcher stage 3)
+std::unordered_map<std::uint64_t, std::string> g_files;
+std::unordered_set<std::uint64_t> g_dumped;
+std::unordered_map<std::uint64_t, std::uint64_t> g_known;  // a texture's identity in the decode cache -> its content hash: decoded again later, it is not read back again
+std::string g_pack, g_dump;
+// The larger pictures on the card, by content hash. The game sends the same texture to video memory again and again, to
+// different places, and each time it is a new kept texture: they all show the one larger picture, which leaves the card when
+// the last of them is dropped.
+struct Big {
+    std::uint32_t offset, order, shift, users;
+};
+std::unordered_map<std::uint64_t, Big> g_big;
+bool g_ready = false, g_busy = false;
+void process();  // after a submit (defined below read_back)
+void preload(std::vector<std::pair<std::uint64_t, std::string>> files);  // local change: below read_tga
+void start_packs(const std::string &list);  // local change: below larger_picture
+std::uint64_t g_seen = 0, g_loads = 0, g_again = 0, g_passes = 0;
+
+void init() {
+    if (g_ready) return;
+    g_ready = true;
+    if (const char *e = std::getenv("PS2_TEX_PACK")) g_pack = e;
+    if (const char *e = std::getenv("PS2_TEX_DUMP")) g_dump = e;
+    if (const char *e = std::getenv("PS2_TEX_ENHANCED")) g_enhanced.store(std::atoi(e) != 0);
+    if (!g_pack.empty()) {
+        std::error_code error;
+        for (const auto &entry : std::filesystem::directory_iterator(os::path(g_pack), error)) {
+            const std::string name = os::utf8(entry.path().filename());
+            if (name.size() < 22 || name.compare(name.size() - 4, 4, ".tga") != 0 || name[16] != '_') continue;
+            char *end = nullptr;
+            const std::uint64_t id = std::strtoull(name.substr(0, 16).c_str(), &end, 16);
+            if (end && *end == 0) g_files[id] = os::utf8(entry.path());
+        }
+        std::fprintf(stderr, "[textures] %zu replacement pictures in %s\n", g_files.size(), g_pack.c_str());
+        if (!g_files.empty()) preload(std::vector<std::pair<std::uint64_t, std::string>>(g_files.begin(), g_files.end()));  // local change
+    }
+    if (!g_dump.empty()) std::fprintf(stderr, "[textures] writing decoded textures into %s\n", g_dump.c_str());
+    // local change (launcher stage 3): PCSX2-style packs of the enabled mods, highest first: "<pictures>*<cache>|<pictures>*<cache>|..."
+    if (const char *e = std::getenv("PS2_TEX_PACKS"); e && *e) start_packs(e);
+}
+
+bool packs_on();  // below larger_picture
+
+bool active() {
+    init();
+    return !g_files.empty() || !g_dump.empty() || packs_on();
+}
+
+std::uint64_t hash(const std::uint32_t *pixels, std::uint32_t w, std::uint32_t h) {
+    std::uint64_t value = 1469598103934665603ull ^ (static_cast<std::uint64_t>(w) << 32 | h);
+    for (std::size_t i = 0, n = static_cast<std::size_t>(w) * h; i < n; ++i) {
+        value ^= pixels[i];
+        value *= 1099511628211ull;
+    }
+    return value;
+}
+
+void write_tga(const std::string &path, const std::uint32_t *pixels, std::uint32_t w, std::uint32_t h) {
+    std::FILE *f = os::open(path, "wb");
+    if (!f) return;
+    const std::uint8_t header[18] = {0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, static_cast<std::uint8_t>(w), static_cast<std::uint8_t>(w >> 8),
+                                     static_cast<std::uint8_t>(h), static_cast<std::uint8_t>(h >> 8), 32, 0x28};  // 32 bits, top row first
+    std::fwrite(header, 1, sizeof header, f);
+    std::vector<std::uint8_t> row(static_cast<std::size_t>(w) * 4);
+    for (std::uint32_t y = 0; y < h; ++y) {
+        for (std::uint32_t x = 0; x < w; ++x) {
+            const std::uint32_t p = pixels[static_cast<std::size_t>(y) * w + x];
+            row[x * 4] = static_cast<std::uint8_t>(p >> 16), row[x * 4 + 1] = static_cast<std::uint8_t>(p >> 8), row[x * 4 + 2] = static_cast<std::uint8_t>(p), row[x * 4 + 3] = static_cast<std::uint8_t>(p >> 24);
+        }
+        std::fwrite(row.data(), 1, row.size(), f);
+    }
+    std::fclose(f);
+}
+
+// An uncompressed 32-bit TGA as RGBA words, top row first. False when it is anything else.
+bool read_tga(const std::string &path, std::vector<std::uint32_t> &out, std::uint32_t &w, std::uint32_t &h) {
+    std::FILE *f = os::open(path, "rb");
+    if (!f) return false;
+    std::uint8_t header[18];
+    bool ok = std::fread(header, 1, 18, f) == 18 && header[2] == 2 && header[16] == 32 && header[1] == 0;
+    if (ok) {
+        w = header[12] | header[13] << 8, h = header[14] | header[15] << 8;
+        ok = w && h && w <= 8192 && h <= 8192 && std::fseek(f, header[0], SEEK_CUR) == 0;
+    }
+    if (ok) {
+        std::vector<std::uint8_t> bytes(static_cast<std::size_t>(w) * h * 4);
+        ok = std::fread(bytes.data(), 1, bytes.size(), f) == bytes.size();
+        if (ok) {
+            out.resize(static_cast<std::size_t>(w) * h);
+            const bool top_first = header[17] & 0x20;
+            for (std::uint32_t y = 0; y < h; ++y) {
+                const std::uint8_t *row = bytes.data() + static_cast<std::size_t>(top_first ? y : h - 1 - y) * w * 4;
+                for (std::uint32_t x = 0; x < w; ++x)
+                    out[static_cast<std::size_t>(y) * w + x] = row[x * 4 + 2] | row[x * 4 + 1] << 8 | row[x * 4] << 16 | static_cast<std::uint32_t>(row[x * 4 + 3]) << 24;
+            }
+        }
+    }
+    std::fclose(f);
+    return ok;
+}
+
+// local change: the larger pictures are read into memory by a thread when the game starts (81 MB for the 200 of the HD pack), so a
+// texture seen for the first time does not wait for the disc of the PC: reading a file in process() took 15 to 55 ms of a frame
+// when several came at once. A picture the thread has not reached yet is read where it is needed, as before.
+struct Loaded {
+    std::vector<std::uint32_t> pixels;
+    std::uint32_t w = 0, h = 0;
+};
+std::mutex g_loaded_mutex;
+std::unordered_map<std::uint64_t, std::shared_ptr<const Loaded>> g_loaded;
+
+void preload(std::vector<std::pair<std::uint64_t, std::string>> files) {
+    std::thread([files = std::move(files)] {
+        for (const auto &[id, path] : files) {
+            auto picture = std::make_shared<Loaded>();
+            if (!read_tga(path, picture->pixels, picture->w, picture->h)) continue;
+            std::lock_guard<std::mutex> lock(g_loaded_mutex);
+            g_loaded.emplace(id, std::move(picture));
+        }
+    }).detach();
+}
+
+// the larger picture for `id`: from memory when the thread has read it, from the file otherwise
+bool larger_picture(std::uint64_t id, const std::string &path, std::vector<std::uint32_t> &out, std::uint32_t &w, std::uint32_t &h) {
+    {
+        std::lock_guard<std::mutex> lock(g_loaded_mutex);
+        if (const auto it = g_loaded.find(id); it != g_loaded.end()) {
+            out = it->second->pixels;
+            w = it->second->w, h = it->second->h;
+            return true;
+        }
+    }
+    return read_tga(path, out, w, h);
+}
+
+// local change (launcher stage 3): the texture packs of the mods (texpack.hpp), found by picture. One thread owns the packs: it reads
+// or makes their indexes, then answers jobs: a texture named for the first time comes with its pixels and is compared with the pack
+// pictures of its size (the first pack in order with a match wins; each pack remembers its answers in its matches.txt), and the
+// chosen picture is read from its file there too. The drawing thread only hands jobs over and takes the answers (process); until its
+// answer comes a texture shows its original picture. Answers stay known for the whole run; the pictures themselves are kept in memory
+// only up to kKeepBytes once on the card (asked for again from their file when the card dropped them and they come back).
+struct PackJob {
+    std::uint64_t id = 0;
+    std::uint32_t w = 0, h = 0;
+    std::vector<std::uint32_t> pixels;  // empty: only the picture of a known answer is wanted
+};
+struct Answer {
+    int pack = -1, file = -1;               // -1: no pack has a picture for it
+    std::shared_ptr<const Loaded> picture;  // null while not read (or dropped from memory)
+    bool known = false;                     // the thread has answered
+};
+std::vector<std::unique_ptr<ps2::texpack::Pack>> g_packs;
+std::mutex g_pack_mutex;
+std::condition_variable g_pack_cv;
+std::deque<PackJob> g_pack_jobs;  // (g_pack_mutex) to the thread
+struct Done {
+    std::uint64_t id;
+    int pack, file;
+    std::shared_ptr<const Loaded> picture;
+};
+std::vector<Done> g_pack_done;                       // (g_pack_mutex) from the thread
+std::unordered_map<std::uint64_t, Answer> g_answers;  // the drawing thread's (an entry = asked)
+std::deque<std::uint64_t> g_keep_order;               // pictures kept in memory, oldest first
+std::uint64_t g_keep_bytes = 0;
+constexpr std::uint64_t kKeepBytes = 256ull << 20;
+std::uint64_t g_pack_matched = 0, g_pack_none = 0, g_pack_jobs_sent = 0;
+
+bool packs_on() { return !g_packs.empty(); }
+
+void start_packs(const std::string &list) {
+    std::size_t from = 0;
+    for (;;) {
+        const std::size_t bar = list.find('|', from);
+        const std::string entry = list.substr(from, bar == std::string::npos ? std::string::npos : bar - from);
+        if (!entry.empty()) {
+            const std::size_t star = entry.find('*');
+            g_packs.push_back(std::make_unique<ps2::texpack::Pack>(entry.substr(0, star), star == std::string::npos ? std::string() : entry.substr(star + 1)));
+        }
+        if (bar == std::string::npos) break;
+        from = bar + 1;
+    }
+    if (g_packs.empty()) return;
+    std::fprintf(stderr, "[textures] %zu texture packs (mods and the HD textures), indexes being read\n", g_packs.size());
+    std::thread([] {
+        for (std::size_t k = 0; k < g_packs.size(); ++k) {
+            ps2::texpack::Pack &p = *g_packs[k];
+            p.scan();
+            p.build_index();
+            std::fprintf(stderr, "[textures] pack %zu: %zu pictures in %s, index %s in %llu ms, %zu answers known\n", k + 1, p.file_count(), p.folder().c_str(),
+                         p.index_from_file ? "read" : "made", static_cast<unsigned long long>(p.index_ms), p.cached_count());
+        }
+        for (;;) {
+            PackJob job;
+            {
+                std::unique_lock<std::mutex> lock(g_pack_mutex);
+                g_pack_cv.wait(lock, [] { return !g_pack_jobs.empty(); });
+                job = std::move(g_pack_jobs.front());
+                g_pack_jobs.pop_front();
+            }
+            int pack = -1, file = -1;
+            // the original's highest alpha (the console's: 0x80 = opaque, more brightens when blended). DXT pictures of a pack have stray
+            // values above it (187 of 200 HD pack pictures, 3 % of their pixels; 0x81-0x88 where the original has 0x80), which made
+            // see-through menu panels whiter: the larger picture's alpha is held to the original's highest.
+            static std::unordered_map<std::uint64_t, std::uint8_t> top_alpha;
+            if (!job.pixels.empty()) {
+                std::uint32_t top = 0;
+                for (std::uint32_t px : job.pixels) top = std::max(top, px >> 24);
+                top_alpha[job.id] = static_cast<std::uint8_t>(top);
+            }
+            for (std::size_t k = 0; k < g_packs.size() && file < 0; ++k) {
+                ps2::texpack::Pack &p = *g_packs[k];
+                bool found = false;
+                int f = p.cached(job.id, found);
+                if (!found && !job.pixels.empty()) {
+                    const ps2::texpack::Pack::Result r = p.match(job.pixels.data(), job.w, job.h);
+                    f = r.file;
+                    // PS2_TEX_MATCH_DUMP=<folder>: each texture looked at, as <our hash>_WxH.tga, and a line "ours WxH file diff" in matches.txt there
+                    static const std::string match_dump = ps2::os::env("PS2_TEX_MATCH_DUMP");
+                    if (!match_dump.empty()) {
+                        char name[64];
+                        std::snprintf(name, sizeof name, "/%016llx_%ux%u", static_cast<unsigned long long>(job.id), job.w, job.h);
+                        write_tga(match_dump + name + ".tga", job.pixels.data(), job.w, job.h);
+                        if (std::FILE *log = ps2::os::open(match_dump + "/matches.txt", "ab")) {
+                            std::fprintf(log, "%s\t%s\t%.2f\t%zu\n", name + 1, f >= 0 ? p.file_name(f).c_str() : "-", r.diff, k);
+                            std::fclose(log);
+                        }
+                    }
+                    p.remember(job.id, f);
+                }
+                if (f >= 0) pack = static_cast<int>(k), file = f;
+            }
+            std::shared_ptr<Loaded> picture;
+            if (file >= 0) {
+                picture = std::make_shared<Loaded>();
+                std::string why;
+                const std::string &path = g_packs[static_cast<std::size_t>(pack)]->path(file);
+                if (!ps2::texpack::load_picture(path, picture->pixels, picture->w, picture->h, &why)) {
+                    std::fprintf(stderr, "[textures] cannot read %s: %s\n", path.c_str(), why.c_str());
+                    picture.reset();
+                    file = -1, pack = -1;
+                } else if (const auto top = top_alpha.find(job.id); top != top_alpha.end()) {
+                    const std::uint32_t limit = static_cast<std::uint32_t>(top->second) << 24;
+                    for (std::uint32_t &px : picture->pixels)
+                        if ((px & 0xFF000000u) > limit) px = (px & 0x00FFFFFFu) | limit;
+                }
+            }
+            std::lock_guard<std::mutex> lock(g_pack_mutex);
+            g_pack_done.push_back({job.id, pack, file, std::move(picture)});
+        }
+    }).detach();
+}
+
+void ask_pack(std::uint64_t id, std::uint32_t w, std::uint32_t h, const std::uint32_t *pixels) {
+    PackJob job;
+    job.id = id, job.w = w, job.h = h;
+    if (pixels) job.pixels.assign(pixels, pixels + static_cast<std::size_t>(w) * h);
+    ++g_pack_jobs_sent;
+    {
+        std::lock_guard<std::mutex> lock(g_pack_mutex);
+        g_pack_jobs.push_back(std::move(job));
+    }
+    g_pack_cv.notify_one();
+}
+
+// a picture just put on the card stays in memory a while (the same texture often comes back soon); the oldest leave over kKeepBytes
+void keep_in_memory(std::uint64_t id) {
+    const auto it = g_answers.find(id);
+    if (it == g_answers.end() || !it->second.picture) return;
+    g_keep_order.push_back(id);
+    g_keep_bytes += it->second.picture->pixels.size() * 4;
+    while (g_keep_bytes > kKeepBytes && !g_keep_order.empty()) {
+        const auto old = g_answers.find(g_keep_order.front());
+        g_keep_order.pop_front();
+        if (old != g_answers.end() && old->second.picture) {
+            g_keep_bytes -= std::min<std::uint64_t>(g_keep_bytes, old->second.picture->pixels.size() * 4);
+            old->second.picture.reset();
+        }
+    }
+}
+}  // namespace texrep
+
 // ---- The decode cache -----------------------------------------------------------------------------------------------------
 // Decoded textures stay in the first part of the decoded buffer (kCachedWords) across batches, submits and frames, and are used again while what
 // they were decoded from is unchanged. "Unchanged" is decided by identities, the idea of the card path's texture identities (hwcache.cpp) written
@@ -1001,7 +1321,8 @@ bool rendered(const Range &r) {
 // block its texels lie in and the numbers of the palette groups it reads. The numbers change in the order of the command stream: an upload or a palette
 // load when it is queued (emit_all dispatches every queued one before the batch whose decodes are then planned), a draw after its batch, a copy when it
 // is dispatched. Off with PS2_DECODE_CACHE=0; PS2_DECODE_CACHE_STAT=1 prints what it did every 300 frames.
-constexpr std::uint32_t kCachedOrder = 23;  // 8 Mi words (32 MB), handed out in powers of two (a decoded texture is 2^(tw + th) words)
+constexpr std::uint32_t kCachedOrder = 25;  // 32 Mi words, 128 MB (local change: was 23, 32 MB; the larger pictures of texrep need the room)
+// was:  // 8 Mi words (32 MB), handed out in powers of two (a decoded texture is 2^(tw + th) words)
 constexpr std::uint32_t kCachedWords = 1u << kCachedOrder;
 bool g_dec_on = true, g_dec_small = true, g_dec_stat = false;
 
@@ -1026,7 +1347,29 @@ struct Identities {
     bool page_drawn[512] = {};
     std::uint64_t seq = 0, fresh = 0;
     std::vector<std::array<std::uint64_t, 32>> slot;  // palette slots: the number of each group of 16 entries
+    // local change (texrep): the same again without the place. `content` is a block's number made of the uploaded bytes and the
+    // block's position inside that upload only, valid while content_seq equals block_seq (the block's own number is from that
+    // upload and nothing wrote it since); slot_content is the palette groups' number made the same way, 0 when not known.
+    // The game sends its textures to video memory over and over, to other addresses: the numbers above change with the address,
+    // these do not, so a texture that was read back and named once is known again without reading it back (texrep::g_known).
+    std::uint64_t content[16384] = {}, content_seq[16384] = {};
+    // the part of the block that upload wrote, inside the block's cell: x0 | y0 << 6 | x1 << 12 | y1 << 18 | cell width << 24. A small
+    // texture or a 16-colour palette never fills a block, and is known all the same when what is read lies inside this part.
+    std::uint32_t cover[16384] = {};
+    std::vector<std::array<std::uint64_t, 32>> slot_content;
 } g_id;
+
+// A block's place-free number, 0 when it has none (written in part, drawn over, copied)
+// for a reader of the texels rx0..rx1, ry0..ry1 (in the co-ordinates of the cell cx0..cx1, cy0..cy1 for_cells gave for the block)
+inline std::uint64_t block_content(std::uint32_t b, std::uint32_t cx0, std::uint32_t cy0, std::uint32_t cx1, std::uint32_t cy1, std::uint32_t rx0, std::uint32_t ry0,
+                                   std::uint32_t rx1, std::uint32_t ry1) {
+    if (g_id.content_seq[b] != g_id.block_seq[b] || g_id.page_seq[b >> 5] > g_id.block_seq[b]) return 0;
+    const std::uint32_t c = g_id.cover[b];
+    if ((c >> 24) != cx1 - cx0 + 1) return 0;  // (written in another format: what part of it this reader sees is not worked out)
+    const std::uint32_t x0 = std::max(rx0, cx0) - cx0, y0 = std::max(ry0, cy0) - cy0, x1 = std::min(rx1, cx1) - cx0, y1 = std::min(ry1, cy1) - cy0;
+    if (x0 < (c & 63u) || y0 < ((c >> 6) & 63u) || x1 > ((c >> 12) & 63u) || y1 > ((c >> 18) & 63u)) return 0;
+    return g_id.content[b];
+}
 
 std::uint64_t fresh_id() { return mix64(0xF7E5Bull, ++g_id.fresh) | 1; }
 
@@ -1068,7 +1411,7 @@ void everything_fresh() {
 
 // A host-to-local upload (`rec` as queue_upload builds it: dbp, dbw, dpsm, dsax, dsay, rrw, done, pixels, offset, lead bits, bits per pixel) of
 // bytes whose number is `content`.
-void id_upload(const std::uint32_t *rec, std::uint64_t content) {
+void id_upload(const std::uint32_t *rec, std::uint64_t content, std::uint64_t bytes_number = 0) {
     const std::uint32_t rrw = rec[5], done = rec[6], pixels = rec[7], psm = rec[2];
     if (!rrw || !pixels) return;
     const std::uint32_t x0 = rec[3], x1 = rec[3] + rrw - 1, y0 = rec[4] + done / rrw, y1 = rec[4] + (done + pixels - 1) / rrw;
@@ -1081,6 +1424,8 @@ void id_upload(const std::uint32_t *rec, std::uint64_t content) {
     std::uint64_t chunk = mix64(content, 0x0B10Cull);
     for (int k : {0, 1, 2, 3, 4, 5, 6, 7, 9}) chunk = mix64(chunk, rec[k]);
     chunk = mix64(chunk, rec[10] & 0x7FFFFFFFu);
+    std::uint64_t free_chunk = mix64(bytes_number, 0xF4EEull);  // (texrep) the same without the base pointer, of the bytes themselves
+    for (int k : {1, 2, 3, 4, 5, 6, 7, 9}) free_chunk = mix64(free_chunk, rec[k]);
     std::uint32_t f[5];
     fmt_words(psm, rec[0], rec[1], f);
     for_cells(f, x0, y0, x1, y1, [&](std::uint32_t b, std::uint32_t cx0, std::uint32_t cy0, std::uint32_t cx1, std::uint32_t cy1) {
@@ -1088,6 +1433,11 @@ void id_upload(const std::uint32_t *rec, std::uint64_t content) {
         bool drawn = false;
         g_id.block[b] = (full ? mix64(chunk, b) : mix64(mix64(block_id(b, drawn), chunk), b)) | 1;
         g_id.block_seq[b] = ++g_id.seq;
+        g_id.content[b] = mix64(free_chunk, (b - rec[0]) & 0x3FFFu) | 1;
+        const std::uint32_t ux0 = std::max(x0, cx0), ux1 = std::min(x1, cx1), uy0 = std::max(full0, cy0), uy1 = std::min(full_end - 1, cy1);
+        const bool some = whole_words && bytes_number && full_end > 0 && ux0 <= ux1 && uy0 <= uy1;
+        g_id.cover[b] = some ? (ux0 - cx0) | (uy0 - cy0) << 6 | (ux1 - cx0) << 12 | (uy1 - cy0) << 18 | (cx1 - cx0 + 1) << 24 : 0;
+        g_id.content_seq[b] = some ? g_id.seq : 0;
         g_id.touched[b >> 5] = g_id.block_write[b >> 5] = g_id.seq;
     });
 }
@@ -1126,6 +1476,44 @@ void id_clut(const std::uint32_t *rec) {
         for (std::uint32_t g = 0; g < 16; ++g) next[g] = mix64(h, g);
     else next[csa & 15u] = h;
     g_id.slot[rec[1] % kClutSlots] = next;
+    // (texrep) the place-free number of the same load: its parameters without the palette's base pointer, and the place-free
+    // numbers of the blocks it reads, relative to that pointer; 0 when one of them has none
+    if (g_id.slot_content.size() != g_id.slot.size()) g_id.slot_content.assign(g_id.slot.size(), {});
+    std::uint64_t h2 = 0xC2u;
+    bool known = true;
+    for (int k = 3; k < 10; ++k) h2 = mix64(h2, rec[k]);
+    std::uint32_t r[4] = {0, 0, 7, 1};
+    if (csm) r[0] = rec[8] * 16, r[1] = rec[9], r[2] = rec[8] * 16 + entries - 1, r[3] = rec[9];
+    else if (entries == 256) r[2] = 15, r[3] = 15;
+    for_cells(f, r[0], r[1], r[2], r[3], [&](std::uint32_t b, std::uint32_t cx0, std::uint32_t cy0, std::uint32_t cx1, std::uint32_t cy1) {
+        const std::uint64_t c = block_content(b, cx0, cy0, cx1, cy1, r[0], r[1], r[2], r[3]);
+        known = known && c;
+        h2 = mix64(mix64(h2, c), (b - rec[2]) & 0x3FFFu);
+    });
+    h2 = known ? h2 | 1 : 0;
+    std::array<std::uint64_t, 32> next2 = g_id.slot_content[rec[0] % kClutSlots];
+    if (csm)
+        for (std::uint32_t g = 0; g < entries / 16; ++g) next2[(csa + g) & 31u] = h2 ? mix64(h2, g) | 1 : 0;
+    else if (entries == 256)
+        for (std::uint32_t g = 0; g < 16; ++g) next2[g] = h2 ? mix64(h2, g) | 1 : 0;
+    else next2[csa & 15u] = h2;
+    g_id.slot_content[rec[1] % kClutSlots] = next2;
+}
+
+// (texrep) the place-free number of the palette a set-up reads: 1 for a texture without one, 0 when it is not known
+std::uint64_t palette_content(const std::uint32_t *w) {
+    const std::uint32_t psm = w[14];
+    const bool eight = psm == 0x13 || psm == 0x1B, four = psm == 0x14 || psm == 0x24 || psm == 0x2C;
+    if (!eight && !four) return 1;
+    if (g_id.slot_content.size() != g_id.slot.size()) return 0;
+    const std::array<std::uint64_t, 32> &s = g_id.slot_content[w[22] % kClutSlots];
+    if (four) return s[w[17] & 15u] ? mix64(s[w[17] & 15u], 4) | 1 : 0;
+    std::uint64_t h = 8;
+    for (std::uint32_t g = 0; g < 16; ++g) {
+        if (!s[g]) return 0;
+        h = mix64(h, s[g]);
+    }
+    return h | 1;
 }
 
 // The palette groups a set-up's texture reads (convert in gs.wgsl): 0 to 255 for 8-bit indices, the 16 entries at CSA for 4-bit ones.
@@ -1145,10 +1533,13 @@ std::uint64_t palette_id(const std::uint32_t *w) {
 // (the pages a texture lies in are remembered, they depend only on its base, width, format and size).
 struct TexMemo {
     std::uint64_t ident = 0, seq = 0;
+    std::uint64_t content = 0;  // (texrep) the place-free number of the texels' blocks, 0 when not known
     bool picture = false;
     std::vector<std::uint16_t> pages;
 };
 std::unordered_map<std::uint64_t, TexMemo> g_tex_memo;
+
+std::uint64_t g_texture_content = 0;  // (texrep) set by texture_id: the place-free number of the texture just asked about
 
 bool texture_id(const std::uint32_t *w, std::uint64_t &ident) {
     const std::uint64_t key = mix64(mix64(mix64(w[12], w[13]), w[14]), w[15]);
@@ -1162,6 +1553,7 @@ bool texture_id(const std::uint32_t *w, std::uint64_t &ident) {
         }
         if (valid) {
             ident = m.ident;
+            g_texture_content = m.content;
             return !m.picture;
         }
     } else {
@@ -1175,14 +1567,20 @@ bool texture_id(const std::uint32_t *w, std::uint64_t &ident) {
     bool drawn = false;
     const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
     const std::uint32_t *f = w + 25;  // the texture's format words (fmt_words)
-    for_cells(f, 0, 0, (1u << tw) - 1, (1u << th) - 1, [&](std::uint32_t b, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) {
+    std::uint64_t h2 = mix64(mix64(w[13], w[14]), w[15]);
+    bool known = true;
+    for_cells(f, 0, 0, (1u << tw) - 1, (1u << th) - 1, [&](std::uint32_t b, std::uint32_t cx0, std::uint32_t cy0, std::uint32_t cx1, std::uint32_t cy1) {
         h = mix64(h, block_id(b, drawn));
+        const std::uint64_t c = block_content(b, cx0, cy0, cx1, cy1, 0, 0, (1u << tw) - 1, (1u << th) - 1);
+        known = known && c;
+        h2 = mix64(mix64(h2, c), (b - w[12]) & 0x3FFFu);
         const std::uint16_t p = static_cast<std::uint16_t>(b >> 5);
         if (m.pages.empty() || m.pages.back() != p) m.pages.push_back(p);
     });
     std::sort(m.pages.begin(), m.pages.end());
     m.pages.erase(std::unique(m.pages.begin(), m.pages.end()), m.pages.end());
     m.ident = ident = h;
+    m.content = g_texture_content = known && !drawn ? h2 | 1 : 0;
     m.picture = drawn;
     ++g_dec_count.walks;
     g_dec_count.picture_walks += drawn;
@@ -1196,6 +1594,11 @@ struct Kept {
     std::uint64_t pal, ident, used, batch;
     std::uint32_t offset, order;
     bool live;
+    // local change (texrep): 0 not looked at yet, 1 has no larger picture, 2 has one, at big_offset (2^big_order words, 2^big_shift times the size each way),
+    // 3 being read back (texrep::process)
+    std::uint8_t big_state = 0;
+    std::uint32_t big_offset = 0, big_order = 0, big_shift = 0;
+    std::uint64_t big_hash = 0;  // its entry in texrep::g_big
 };
 std::vector<Kept> g_kept;
 std::vector<std::uint32_t> g_kept_free;
@@ -1250,11 +1653,31 @@ void kept_drop(std::uint32_t i) {
             break;
         }
     space_free(e.offset, e.order);
+    if (e.big_state == 2) {
+        const auto big = texrep::g_big.find(e.big_hash);
+        if (big != texrep::g_big.end() && --big->second.users == 0) {
+            space_free(big->second.offset, big->second.order);
+            texrep::g_big.erase(big);
+        }
+    }
+    e.big_state = 0;
     e.live = false;
     g_kept_free.push_back(i);
 }
 
+namespace texrep {
+// What a set-up that reads this kept texture gets in its `dec` word: the original, or the larger picture with its factor on top
+std::uint32_t offset_of(const Kept &e) {
+    return e.big_state == 2 && g_enhanced.load(std::memory_order_relaxed) ? e.big_offset | e.big_shift << 28 : e.offset;
+}
+}
+
 void dec_reset() {
+    texrep::g_big.clear();  // local change: the larger pictures go with the kept textures
+    texrep::g_pending.clear();
+    texrep::g_known.clear();
+    texrep::g_flight.clear();  // local change: a pass still in flight finishes with nothing to name
+    texrep::g_waiting.clear();  // local change: (their kept textures are gone; the packs' answers stay, they are by content)
     g_kept.clear();
     g_kept_free.clear();
     g_kept_index.clear();
@@ -1371,12 +1794,13 @@ void plan_decodes(std::uint32_t prims) {
                     ++g_dec_count.found;
                     found->used = g_serial;
                     found->batch = g_dec_batch;
-                    w[24] = found->offset;
-                    g_assigned.push_back({i, found->offset, words});
+                    w[24] = texrep::offset_of(*found);
+                    g_assigned.push_back({i, w[24], words});
                     continue;
                 }
-                if (!big) continue;
-                if (!worth()) {
+                const bool replacing = texrep::active();  // then every texture is decoded and kept (texrep)
+                if (!big && !replacing) continue;
+                if (!replacing && !worth()) {
                     ++g_dec_count.in_place;
                     continue;
                 }
@@ -1393,6 +1817,17 @@ void plan_decodes(std::uint32_t prims) {
                     Kept &e = g_kept[at];
                     std::copy(key, key + 8, e.key);
                     e.pal = pal, e.ident = ident, e.used = g_serial, e.batch = g_dec_batch, e.offset = offset, e.order = tw + th, e.live = true;
+                    e.big_state = 0;
+                    if (replacing) {
+                        const std::uint64_t pal2 = palette_content(w);
+                        std::uint64_t name = g_texture_content && pal2 ? mix64(g_texture_content, pal2) : 0;
+                        if (static const bool dbg = std::getenv("PS2_TEX_DEBUG") != nullptr; dbg) { static std::uint64_t n[4]; ++n[(g_texture_content ? 0 : 1) | (pal2 ? 0 : 2)]; if ((n[0] + n[1] + n[2] + n[3]) % 500 == 0) std::fprintf(stderr, "[texdbg] named %llu, no texture number %llu, no palette number %llu, neither %llu; last psm %02X size %ux%u tbw %u\n", (unsigned long long)n[0], (unsigned long long)n[1], (unsigned long long)n[2], (unsigned long long)n[3], w[14], 1u << tw, 1u << th, w[13]); }
+                        if (name) {
+                            for (int k = 1; k < 8; ++k) name = mix64(name, key[k]);  // the set-up words but the base pointer
+                            name |= 1;
+                        }
+                        texrep::g_pending.push_back({at, ident, g_serial, name});
+                    }
                     g_kept_index.emplace(kept_hash(key, pal, ident), at);
                     ++g_dec_count.decoded;
                     g_dec_count.decoded_words += words;
@@ -1770,7 +2205,7 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
     op.image = im.id;
     const Range pal_range_of_upload = op.range;
     queue_pre(op);
-    if (g_dec_on) id_upload(op.rec, source ? mix64(g_cache_uid, 0xCAC4Eull) : n < kCacheMinBytes ? bytes_id(bytes, n) : fresh_id());  // after queue_pre, as hwcache below
+    if (g_dec_on) id_upload(op.rec, source ? mix64(g_cache_uid, 0xCAC4Eull) : n < kCacheMinBytes ? bytes_id(bytes, n) : fresh_id(), texrep::active() ? bytes_id(bytes, n) : 0);  /* local change: the third number, of every byte, is for texrep's place-free names */  // after queue_pre, as hwcache below
     if (g_live) hw::pal_upload(im.dbp, im.dbw, im.dpsm, im.dsax, im.dsay, im.rrw, im.done, pixels, static_cast<std::uint32_t>(lead_bits), im.bpp, bytes, size, pal_range_of_upload.lo, pal_range_of_upload.hi);
     if (hwcache::g_on)  // after queue_pre: a batch that reads this memory was flushed by it and saw the old numbers
         hwcache::write_upload(im.dbp, im.dbw, im.dpsm, static_cast<int>(im.dsax), static_cast<int>(im.dsay + first), static_cast<int>(im.dsax + im.rrw - 1), static_cast<int>(im.dsay + last),
@@ -2124,7 +2559,14 @@ void submit(WGPUTextureView present_view = nullptr) {
             std::uint64_t t[2];
             std::memcpy(t, mapped, sizeof t);
             if (t[1] > t[0]) {
+#ifndef __EMSCRIPTEN__
+                // local change: wgpu-native hands back the card's ticks, not ns; on the RX 6750 XT under Direct3D 12 a tick is 10 ns, so the
+                // GPU % in the window title read 10x too low
+                static const double period = wgpuQueueGetTimestampPeriod(g_queue);
+                g_measured_ns += static_cast<std::uint64_t>(static_cast<double>(t[1] - t[0]) * period);
+#else
                 g_measured_ns += t[1] - t[0];
+#endif
                 ++g_measured;
             }
         }
@@ -2208,7 +2650,7 @@ void submit(WGPUTextureView present_view = nullptr) {
         rd.colorAttachments = &color;
         WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
         const float w = static_cast<float>(g_surface_width), h = static_cast<float>(g_surface_height);
-        const float aspect = g_options.widescreen ? 16.0f / 9.0f : 4.0f / 3.0f;
+        const float aspect = display_aspect();
         const float vw = std::min(w, h * aspect), vh = vw / aspect;
         wgpuRenderPassEncoderSetViewport(rp, (w - vw) * 0.5f, (h - vh) * 0.5f, vw, vh, 0.0f, 1.0f);
         wgpuRenderPassEncoderSetPipeline(rp, g_blit);
@@ -2299,6 +2741,7 @@ void submit(WGPUTextureView present_view = nullptr) {
     g_shapes.restart();
     g_decoded_used = 0;
     g_clut_loads = 0;
+    texrep::process();  // local change: the textures this submit decoded (texture replacement)
 }
 
 bool readback_log_enabled() {
@@ -2345,6 +2788,236 @@ void read_back(WGPUBuffer source, std::uint64_t bytes, void *out, std::uint64_t 
         std::chrono::duration<double, std::milli>(ready - submitted).count(),
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ready).count());
 }
+
+namespace texrep {
+// After a submit: the textures decoded by it are on the card now. Those not known by their place-free name are read back, all
+// in one go (one copy pass however many there are: a pass each, for thousands of textures a minute, cost more than drawing the
+// game), named by their content and written out when dumping. Then each gets its larger picture when the folder has one.
+// local change: the read-back does not wait. Waiting for the copy meant waiting for everything the card had been given, the whole
+// picture being drawn included, 6 to 13 ms each time; turning the camera in build mode brings new textures every frame or two, and
+// those waits made one frame in two too slow for 60 Hz (the stutter). Now the copy is started and mapped without waiting, the
+// emulation runs on, and a later call (after a later submit) names the textures once the card has finished: a new texture shows
+// its original picture for a frame or two before its larger one. One pass is in flight at a time, in its own buffer; a kept
+// texture on its way has big_state 3.
+WGPUBuffer g_tex_read = nullptr;      // its read-back buffer
+constexpr std::uint32_t kTexReadWords = 1u << 20;
+std::uint64_t g_flight_bytes = 0;
+bool g_mapping = false, g_mapped = false;
+
+void finish(std::vector<Job> &jobs, const std::vector<std::uint32_t> &words);
+
+// local change (launcher stage 3): the texture packs' answers that came in; the textures that waited for them are finished now
+void take_pack_answers(const std::vector<std::uint32_t> &words) {
+    static std::vector<Done> done;
+    done.clear();
+    {
+        std::lock_guard<std::mutex> lock(g_pack_mutex);
+        done.swap(g_pack_done);
+    }
+    for (Done &d : done) {
+        Answer &a = g_answers[d.id];
+        a.known = true, a.pack = d.pack, a.file = d.file, a.picture = std::move(d.picture);
+        ++(d.file >= 0 ? g_pack_matched : g_pack_none);
+    }
+    if (g_waiting.empty()) return;
+    static std::vector<Job> ready;
+    ready.clear();
+    std::size_t kept = 0;
+    for (const Job &j : g_waiting) {
+        const auto it = g_answers.find(j.id);
+        if (it != g_answers.end() && it->second.known) ready.push_back(j);
+        else g_waiting[kept++] = j;
+    }
+    g_waiting.resize(kept);
+    if (!ready.empty()) finish(ready, words);
+}
+
+void process() {
+    if (g_busy) return;
+    g_busy = true;
+    static std::vector<std::uint32_t> words;
+    if (!g_packs.empty()) take_pack_answers(words);  // local change
+    if (g_mapping) {
+        if (!g_mapped) wgpuDevicePoll(g_device, false, nullptr);
+        if (!g_mapped) {  // the card is still at it: try again after the next submit
+            g_busy = false;
+            return;
+        }
+        words.resize(g_flight_bytes / 4);
+        if (const void *mapped = wgpuBufferGetConstMappedRange(g_tex_read, 0, g_flight_bytes)) std::memcpy(words.data(), mapped, g_flight_bytes);
+        else std::fill(words.begin(), words.end(), 0u);
+        wgpuBufferUnmap(g_tex_read);
+        g_mapping = g_mapped = false;
+        ++g_passes;
+        finish(g_flight, words);  // (empty when the cache was reset meanwhile)
+        g_flight.clear();
+    }
+    if (g_pending.empty()) {
+        g_busy = false;
+        return;
+    }
+    static std::vector<Job> jobs, known;
+    jobs.clear();
+    known.clear();
+    std::size_t kept_back = 0;
+    std::uint32_t total = 0;
+    for (std::size_t n = 0; n < g_pending.size(); ++n) {
+        const Pending p = g_pending[n];
+        if (p.serial >= g_serial) {  // (decoded by a batch that is not submitted yet)
+            g_pending[kept_back++] = p;
+            continue;
+        }
+        if (p.at >= g_kept.size() || !g_kept[p.at].live || g_kept[p.at].ident != p.ident || g_kept[p.at].big_state != 0) continue;
+        Job j{p, 0, 0, g_kept[p.at].key[3] & 0xFFu, g_kept[p.at].key[3] >> 8, ~0u, 0};
+        j.w = 1u << j.tw, j.h = 1u << j.th;
+        const auto found = p.name && g_dump.empty() ? g_known.find(p.name) : g_known.end();
+        if (found != g_known.end()) {
+            j.id = found->second;
+            ++g_again;
+            known.push_back(j);
+            continue;
+        }
+        if (total + j.w * j.h > kTexReadWords) {  // no room in this pass: a later one
+            g_pending[kept_back++] = p;
+            continue;
+        }
+        j.at_words = total;
+        total += j.w * j.h;
+        jobs.push_back(j);
+    }
+    g_pending.resize(kept_back);
+    if (!known.empty()) finish(known, words);  // the known ones need nothing from the card: done now
+    if (total) {
+        if (!g_tex_read) g_tex_read = make_buffer(static_cast<std::uint64_t>(kTexReadWords) * 4, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
+        g_flight = jobs;
+        for (const Job &j : g_flight) g_kept[j.p.at].big_state = 3;  // on its way: a second decode of it is not read again
+        post::drain();
+        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
+        for (const Job &j : g_flight)
+            wgpuCommandEncoderCopyBufferToBuffer(enc, g_decoded, static_cast<std::uint64_t>(g_kept[j.p.at].offset) * 4, g_tex_read, static_cast<std::uint64_t>(j.at_words) * 4, static_cast<std::uint64_t>(j.w) * j.h * 4);
+        WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
+        wgpuQueueSubmit(g_queue, 1, &cmd);
+        wgpuCommandBufferRelease(cmd);
+        wgpuCommandEncoderRelease(enc);
+        WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
+        cb.mode = WGPUCallbackMode_AllowProcessEvents;
+        cb.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void *, void *) {
+            if (status != WGPUMapAsyncStatus_Success) std::fprintf(stderr, "[textures] read-back map failed %d\n", static_cast<int>(status));
+            g_mapped = true;
+        };
+        g_flight_bytes = static_cast<std::uint64_t>(total) * 4;
+        g_mapping = true;
+        g_mapped = false;
+        wgpuBufferMapAsync(g_tex_read, WGPUMapMode_Read, 0, g_flight_bytes, cb);
+    }
+    g_busy = false;
+}
+
+void finish(std::vector<Job> &jobs, const std::vector<std::uint32_t> &words) {
+    static std::vector<std::uint32_t> big;
+    // local change: at most this much of larger pictures goes to the card per call; the rest wait for the next submit (they show their
+    // original picture a little longer). The game sometimes brings back thousands of textures in one frame (93 larger pictures, 93 MB,
+    // ~40 ms of the drawing thread in one frame when turning the camera in build mode).
+    constexpr std::uint64_t kBudget = 8u << 20;
+    std::uint64_t sent = 0;
+    for (Job &j : jobs) {
+        const Pending &p = j.p;
+        // dropped for another's room meanwhile, or the place reused for another texture: then what was read is not its picture
+        const std::uint8_t want = j.at_words != ~0u ? 3 : j.waited ? 4 : 0;
+        if (p.at >= g_kept.size() || !g_kept[p.at].live || g_kept[p.at].ident != p.ident || g_kept[p.at].big_state != want) continue;
+        g_kept[p.at].big_state = 1;
+        const std::uint32_t w = j.w, h = j.h, tw = j.tw, th = j.th, count = w * h;
+        std::uint64_t id = j.id;
+        if (j.at_words != ~0u) {
+            const std::uint32_t *px = words.data() + j.at_words;
+            id = hash(px, w, h);
+            if (g_known.size() > 65536) g_known.clear();
+            if (p.name) g_known[p.name] = id;
+            ++g_seen;
+            if (!g_dump.empty() && w >= 8 && h >= 8 && g_dumped.insert(id).second) {
+                bool plain = true;
+                for (std::uint32_t i = 1; i < count && plain; ++i) plain = px[i] == px[0];
+                if (!plain) {
+                    char name[64];
+                    std::snprintf(name, sizeof name, "/%016llx_%ux%u.tga", static_cast<unsigned long long>(id), w, h);
+                    write_tga(g_dump + name, px, w, h);
+                }
+            }
+        }
+        if (const auto shared = g_big.find(id); shared != g_big.end()) {  // on the card already, for another copy of this texture
+            Kept &e = g_kept[p.at];
+            ++shared->second.users;
+            e.big_offset = shared->second.offset, e.big_order = shared->second.order, e.big_shift = shared->second.shift, e.big_hash = id, e.big_state = 2;
+            continue;
+        }
+        // local change (launcher stage 3): the mods' texture packs first (highest first), the folder of our own names last
+        std::shared_ptr<const Loaded> from_pack;
+        std::string pack_path;
+        if (!g_packs.empty()) {
+            auto [it, fresh] = g_answers.try_emplace(id);
+            Answer &a = it->second;
+            if (fresh) ask_pack(id, w, h, j.at_words != ~0u ? words.data() + j.at_words : nullptr);
+            else if (a.known && a.file >= 0 && !a.picture) {  // its picture left memory: read again
+                a.known = false;
+                ask_pack(id, w, h, nullptr);
+            }
+            if (!a.known) {  // the original meanwhile; finished when the answer comes (take_pack_answers)
+                g_kept[p.at].big_state = 4;
+                Job wait = j;
+                wait.id = id, wait.at_words = ~0u, wait.waited = true;
+                g_waiting.push_back(wait);
+                continue;
+            }
+            if (a.file >= 0) from_pack = a.picture, pack_path = g_packs[static_cast<std::size_t>(a.pack)]->path(a.file);
+        }
+        const auto file = g_files.find(id);
+        if (!from_pack && file == g_files.end()) continue;
+        if (sent >= kBudget) {  // over the budget: again after the next submit (its name is known now, so no read-back)
+            g_kept[p.at].big_state = 0;
+            g_pending.push_back(p);
+            continue;
+        }
+        std::uint32_t bw = 0, bh = 0;
+        const std::vector<std::uint32_t> *source = &big;
+        if (from_pack) source = &from_pack->pixels, bw = from_pack->w, bh = from_pack->h;
+        else if (!larger_picture(id, file->second, big, bw, bh)) {
+            std::fprintf(stderr, "[textures] cannot read %s (it must be an uncompressed 32-bit TGA)\n", file->second.c_str());
+            continue;
+        }
+        const std::string &source_name = from_pack ? pack_path : file->second;
+        std::uint32_t shift = 0;
+        while (shift < 4 && (w << shift) < bw) ++shift;
+        if (shift == 0 || shift > 3 || (w << shift) != bw || (h << shift) != bh || tw + th + 2 * shift > kCachedOrder - 2) {
+            static std::unordered_set<std::string> said_size;
+            if (said_size.insert(source_name).second)
+                std::fprintf(stderr, "[textures] %s is %u x %u, not 2, 4 or 8 times %u x %u (or too large): left out\n", source_name.c_str(), bw, bh, w, h);
+            continue;
+        }
+        g_kept[p.at].batch = g_dec_batch;  // (the room is made at other textures' cost, never this one's)
+        std::uint32_t offset = 0;
+        if (!kept_room(tw + th + 2 * shift, offset)) continue;
+        ++g_loads;
+        wgpuQueueWriteBuffer(g_queue, g_decoded, static_cast<std::uint64_t>(offset) * 4, source->data(), source->size() * 4);
+        sent += source->size() * 4;
+        if (from_pack) keep_in_memory(id);
+        Kept &e = g_kept[p.at];
+        e.big_offset = offset, e.big_order = tw + th + 2 * shift, e.big_shift = shift, e.big_hash = id, e.big_state = 2;
+        g_big[id] = Big{offset, e.big_order, shift, 1};
+    }
+    static std::uint64_t said = 0;
+    if (const std::uint64_t total_seen = g_seen + g_again; total_seen / 500 != said / 500 || (total_seen != said && said < 8))
+        std::fprintf(stderr, "[textures] frame %llu: %llu textures read back and named (in %llu passes), %llu known again without, larger pictures put on the card %llu times\n",
+                     static_cast<unsigned long long>(frame_count()), static_cast<unsigned long long>(g_seen), static_cast<unsigned long long>(g_passes),
+                     static_cast<unsigned long long>(g_again), static_cast<unsigned long long>(g_loads));
+    static std::uint64_t said_packs = 0;  // local change: the packs' answers
+    if (!g_packs.empty() && (g_pack_matched + g_pack_none) / 200 != said_packs / 200)
+        std::fprintf(stderr, "[textures] packs: %llu textures asked, %llu with a picture, %llu without, %zu waiting, %llu MB of pictures in memory\n",
+                     static_cast<unsigned long long>(g_pack_jobs_sent), static_cast<unsigned long long>(g_pack_matched), static_cast<unsigned long long>(g_pack_none),
+                     g_waiting.size(), static_cast<unsigned long long>(g_keep_bytes >> 20));
+    said_packs = g_pack_matched + g_pack_none;
+    said = g_seen + g_again;
+}
+}  // namespace texrep
 
 void wait_gpu() {
     post::drain();
@@ -3342,12 +4015,27 @@ bool init(Mode m) {
         }
     }
     if (const char *scale = std::getenv("PS2_SCALE")) g_scale = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(scale)), 1u, 4u);
+    if (const char *aa = std::getenv("PS2_AA")) g_aa_mode = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(aa)), 0u, 9u);
+    g_aa_room = g_aa_mode <= 1;
+    // Supersampling (PS2_AA 3..9 = 2x..8x): the chosen render resolution that many times over each way (at most 8x the PS2's size in all);
+    // the present's area average (reduced_scene in blit.wgsl) shrinks it to the window. PS2_AA_SCALE=<n> sets the drawing scale directly (tests, 1 to 8).
+    if (g_aa_mode >= 3) g_scale = std::min<std::uint32_t>(g_scale * (g_aa_mode - 1u), 8u);
+    // Quality: memory at twice the scale too, but each raster thread draws a 2 x 2 group of samples and reads the texture once for it
+    // (FINE in gs.wgsl): the edges get the finer samples, the costly texture reads stay at the chosen scale. At most 4x chosen (8x drawn).
+    if (g_aa_mode == 2) {
+        g_scale = std::min<std::uint32_t>(g_scale, 4u) * 2u;
+        g_fine = 2;
+    }
+    if (const std::string s = os::env("PS2_AA_SCALE"); !s.empty()) g_scale = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(s.c_str())), 1u, 8u);
+    if (g_scale % 2u) g_fine = 1;  // (an odd test scale: Quality's groups need an even one)
+    std::fprintf(stderr, "[gpu] drawing at %ux (PS2_AA %s: %s)\n", g_scale, std::getenv("PS2_AA") ? "set" : "not set",
+                 g_aa_mode == 0 ? "Off or Fast, switched by the window" : g_aa_mode == 1 ? "Fast" : g_aa_mode == 2 ? "Quality (experimental)" : "supersampling");
     // PS2_SHARP_2D: how upscaled 2D art (text, icons, menus) is filtered, see SHARP in gs.wgsl: 0 plain bilinear, 1 sharp (the
     // default), 2 sharpest
     if (const char *sharp = std::getenv("PS2_SHARP_2D")) g_sharp_2d = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(sharp)), 0u, 2u);
     g_copy_words = (1u << 20) * g_scale * g_scale;
     if (const int tile = std::atoi(os::env("PS2_TILE").c_str()); tile == 4 || tile == 8 || tile == 16) g_tile = tile;
-    tiles::configure(static_cast<int>(g_scale), g_tile);
+    tiles::configure(static_cast<int>(g_scale), g_tile * static_cast<int>(g_fine));  // (Quality: a tile is FINE times the threads each way)
     g_field_words = (1u << 19) * g_scale * g_scale;
     g_vram = make_buffer(static_cast<std::uint64_t>(kMemorySize) * g_scale * g_scale, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
     std::vector<std::uint32_t> tables;
@@ -3357,9 +4045,9 @@ bool init(Mode m) {
     g_tables = make_buffer(tables.size() * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
     wgpuQueueWriteBuffer(g_queue, g_tables, 0, tables.data(), tables.size() * 4);
     g_clut = make_buffer(static_cast<std::uint64_t>(kClutSlots) * kClutEntries * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
-    g_scratch = make_buffer((static_cast<std::uint64_t>(g_copy_words) + 2ull * g_field_words) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc);
+    g_scratch = make_buffer((static_cast<std::uint64_t>(g_copy_words) + (g_aa_room ? 5ull : 2ull) * g_field_words) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc);
     g_cache = make_buffer(static_cast<std::uint64_t>(kCacheWords) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
-    g_decoded = make_buffer((static_cast<std::uint64_t>(kCachedWords) + kDecodedWords) * 4, WGPUBufferUsage_Storage);  // the kept textures, then this submit's pictures
+    g_decoded = make_buffer((static_cast<std::uint64_t>(kCachedWords) + kDecodedWords) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);  /* local change: read back and written by texrep */  // the kept textures, then this submit's pictures
     if (const char *decode = std::getenv("PS2_DECODE")) g_decode = std::atoi(decode) != 0;
     if (const char *cache = std::getenv("PS2_DECODE_CACHE")) g_dec_on = std::atoi(cache) != 0, g_dec_small = std::atoi(cache) != 2;  // 0 off, 2 not for small batches
     g_dec_stat = !os::env("PS2_DECODE_CACHE_STAT").empty();
@@ -3455,7 +4143,7 @@ bool init(Mode m) {
         cd.compute.module = module;
         cd.compute.entryPoint = view(kEntryPoints[entry]);
         // a shader loaded with PS2_GS_SHADER may lack the later constants; each is listed only when the shader declares it
-        WGPUConstantEntry constants[5];
+        WGPUConstantEntry constants[8];
         std::size_t count = 0;
         const auto set = [&](bool declared, const char *key, double value) {
             if (!declared) return;
@@ -3469,6 +4157,11 @@ bool init(Mode m) {
         set(has_fma, "EXPLICIT_FMA", explicit_fma ? 1.0 : 0.0);
         set(has_sharp, "SHARP", static_cast<double>(sharp));
         set(has_mip, "HAS_MIP", mip ? 1.0 : 0.0);
+        // local change: PS2_GPU_PROBE_NOTEX=1 (measuring aid, wrong picture): every texture read answers grey at once (gs.wgsl PROBE_NOTEX)
+        if (entry == kRaster && !os::env("PS2_GPU_PROBE_NOTEX").empty()) set(true, "PROBE_NOTEX", 1.0);
+        if (entry == kRaster && g_fine > 1) set(true, "FINE", static_cast<double>(g_fine));  // local change: anti-aliasing Quality
+        // local change: Extra's alpha-to-coverage (gs.wgsl A2C); PS2_AA_A2C=0 leaves it out (to compare)
+        if (entry == kRaster && g_aa_mode >= 3 && g_scale > 1 && os::env("PS2_AA_A2C") != "0") set(true, "A2C", 1.0);
         cd.compute.constantCount = count;
         cd.compute.constants = constants;
         return wgpuDeviceCreateComputePipeline(g_device, &cd);
@@ -4163,6 +4856,8 @@ bool attach_surface(const SurfaceTarget &target) {
     for (const WGPUPresentMode wanted : {WGPUPresentMode_Immediate, WGPUPresentMode_Mailbox})
         for (std::size_t i = 0; i < caps.presentModeCount; ++i)
             if (caps.presentModes[i] == wanted) g_present_mode = wanted;
+    // local change: PS2_VSYNC=1 (the quick menu's V-sync) presents in step with the screen's refresh (Fifo, every surface offers it)
+    if (os::env("PS2_VSYNC") == "1") g_present_mode = WGPUPresentMode_Fifo;
     // PS2_PRESENT_MODE=fifo, relaxed, mailbox or immediate asks for one mode (when the surface offers it); PS2_FRAME_LATENCY=1..8 sets how many
     // pictures the swap chain keeps in flight. Both are for experiments (docs/speed.md); the log line below says what is used.
     if (std::string want = os::env("PS2_PRESENT_MODE"); !want.empty()) {
@@ -4363,6 +5058,15 @@ std::uint32_t display_params(const DisplaySource &src, std::uint32_t scratch_at)
                         o.active ? 1u : 0u, o.fbp, o.fbw, o.psm, o.dbx, o.dby, static_cast<std::uint32_t>(o.x), static_cast<std::uint32_t>(o.y), o.width, o.height});
 }
 
+// Pushes the three passes for a field of w x h at `current` (woven with `previous` when blend); the result is at aa_base(2).
+void push_fast_aa(std::uint32_t current, std::uint32_t previous, bool blend, std::uint32_t w, std::uint32_t h) {
+    const std::uint32_t param = push_params({current, previous, blend ? 1u : 0u, w, h, aa_base(0), aa_base(1), aa_base(2)});
+    const std::uint32_t gx = (w + 7) / 8, gy = (h + 7) / 8;
+    g_commands.push_back({kAaEdges, gx, gy, param});
+    g_commands.push_back({kAaWeights, gx, gy, param});
+    g_commands.push_back({kAaBlend, gx, gy, param});
+}
+
 bool present(const DisplaySource &src) {
     if (!g_surface) return false;
     static PresentLog log;
@@ -4376,9 +5080,19 @@ bool present(const DisplaySource &src) {
     const std::uint32_t param = display_params(src, current);
     push_display(src, current, param);
     const float sw = static_cast<float>(g_surface_width), sh = static_cast<float>(g_surface_height);
-    const float aspect = g_options.widescreen ? 16.0f / 9.0f : 4.0f / 3.0f;
+    const float aspect = display_aspect();
     const float vw = std::min(sw, sh * aspect), vh = vw / aspect;
-    const std::uint32_t blit[8] = {src.width * g_scale, src.height * g_scale, current, previous, blend ? 1u : 0u, static_cast<std::uint32_t>(vw), static_cast<std::uint32_t>(vh), ps2::video_options()};
+    std::uint32_t blit[8] = {src.width * g_scale, src.height * g_scale, current, previous, blend ? 1u : 0u, static_cast<std::uint32_t>(vw), static_cast<std::uint32_t>(vh), ps2::video_options()};
+    // local change: Fast anti-aliasing on the field, at its own size, before the present enlarges or shrinks it. (A PAL field at 3x is
+    // 1920 x 1533, a little taller than a 1440-line screen, so the present shrinks it in height: the old one-pass filter in blit.wgsl
+    // never ran there.) PS2_AA_REPEAT=<n> runs the passes n times (to measure their cost in the window).
+    const std::uint32_t fw = src.width * g_scale, fh = src.height * g_scale;
+    if ((blit[7] & 1u) && g_aa_room && fw * fh <= g_field_words) {
+        static const int repeat = std::max(1, std::atoi(os::env("PS2_AA_REPEAT").c_str()));
+        for (int i = 0; i < repeat; ++i) push_fast_aa(current, previous, blend, fw, fh);
+        blit[2] = blit[3] = aa_base(2);
+        blit[4] = 0;
+    }
     post::drain();  // the last picture is presented before this one's acquire
     std::memcpy(post::g_blit, blit, sizeof blit);  // written by the next submit (its job with the submit thread), before the frame's other writes
     post::g_blit_pending = true;
@@ -4571,7 +5285,7 @@ bool present_again() {
     // the same picture as the last present (its fields are still in the scratch buffer: the game draws nothing while it waits), with the
     // window's size and the picture look of now
     const float sw = static_cast<float>(g_surface_width), sh = static_cast<float>(g_surface_height);
-    const float aspect = g_options.widescreen ? 16.0f / 9.0f : 4.0f / 3.0f;
+    const float aspect = display_aspect();
     const float vw = std::min(sw, sh * aspect), vh = vw / aspect;
     const std::uint32_t tail[3] = {static_cast<std::uint32_t>(vw), static_cast<std::uint32_t>(vh), ps2::video_options()};
     wgpuQueueWriteBuffer(g_queue, g_blit_params, 20, tail, sizeof tail);
@@ -4673,12 +5387,27 @@ bool display(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::ui
     flush_all();
     const std::uint32_t param = display_params(src, 0);
     push_display(src, 0, param);
-    submit();
     width = src.width * g_scale;
     height = src.height * g_scale;
+    // local change: PS2_AA_DUMP=1 runs Fast anti-aliasing on the dumped frames too (the present is not part of headless dumps)
+    static const bool aa_dump = !os::env("PS2_AA_DUMP").empty();
+    const bool aa = aa_dump && g_aa_room && width * height <= g_field_words;
+    if (aa) push_fast_aa(0, 0, false, width, height);
+    submit();
     rgba.resize(static_cast<std::size_t>(width) * height);
-    read_back(g_scratch, rgba.size() * 4, rgba.data());
+    read_back(g_scratch, rgba.size() * 4, rgba.data(), aa ? static_cast<std::uint64_t>(aa_base(2)) * 4 : 0);
     return true;
 }
 
+// local change: the switch between the original textures and the larger pictures (texrep), for the window's menu
+void set_textures_enhanced(bool on) { texrep::g_enhanced.store(on, std::memory_order_relaxed); }
+bool textures_enhanced() { return texrep::g_enhanced.load(std::memory_order_relaxed); }
+bool textures_available() { texrep::init(); return !texrep::g_files.empty() || texrep::packs_on(); }  // local change: or a mod's pack
+
+}
+
+namespace ps2 {
+void set_textures_enhanced(bool on) { gs::gpu::set_textures_enhanced(on); }
+bool textures_enhanced() { return gs::gpu::textures_enhanced(); }
+bool textures_available() { return gs::gpu::textures_available(); }
 }

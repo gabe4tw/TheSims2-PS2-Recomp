@@ -40,7 +40,7 @@ struct Config {
 };
 
 // The picture looks the F2 key goes through. The number is also the video option bits (ps2/video.hpp): bit 0 smooth edges, bit 1 soft, bit 2 sharp (look 4: cubic enlargement + light sharpening; look 5 = sharp + smooth edges).
-constexpr int kLookCount = 6;
+constexpr int kLookCount = 8;  // local change: 6 / 7 = filter Off (plain pixels), the menu's first filter
 constexpr int kDefaultLook = 5;
 const char *look_name(int look);           // "Soft + smooth edges", for the title and the key card
 const char *look_word(int look);           // the word written in keys.ini

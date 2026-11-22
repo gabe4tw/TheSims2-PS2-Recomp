@@ -85,8 +85,16 @@ void finish_read() {
     if (g_cd.callback) call_guest(g_cd.callback, 1);
 }
 
+// local change: however fast PS2_DISC_SPEED makes the drive, no read is done sooner than this (see the note at the use)
+std::uint64_t floor_cycles() {
+    static const std::uint64_t us = [] { const char *e = std::getenv("PS2_DISC_FLOOR_US"); const long v = e ? std::atol(e) : 0; return static_cast<std::uint64_t>(v < 0 ? 0 : v); }();
+    return us ? usec_to_cycles(us) : 0;
+}
+
 std::uint64_t read_cycles(std::uint32_t sectors) {
-    return usec_to_cycles(400) + static_cast<std::uint64_t>(sectors) * usec_to_cycles(250);
+    // local change: PS2_DISC_SPEED=N makes the drive N times as fast as the console's (1 when unset), to shorten loading
+    static const std::uint64_t speed = [] { const char *e = std::getenv("PS2_DISC_SPEED"); const long v = e ? std::atol(e) : 1; return static_cast<std::uint64_t>(v < 1 ? 1 : v > 1000 ? 1000 : v); }();
+    return std::max<std::uint64_t>((usec_to_cycles(400) + static_cast<std::uint64_t>(sectors) * usec_to_cycles(250)) / speed + 1, floor_cycles());
 }
 
 bool start_read(std::uint32_t lsn, std::uint32_t sectors, std::uint32_t buffer, std::uint32_t mode, bool ee_memory);

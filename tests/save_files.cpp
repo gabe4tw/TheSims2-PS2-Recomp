@@ -130,7 +130,9 @@ int child(const char *mode, const fs::path &p) {
 
 // The child: put the card file in slot 1 (as the runner does at boot), let the test switch of sio2.cpp change page 4000 at frame 0
 // as if the game had saved, then end the run the usual way (the card file is written) or as after a crash.
+int run_two_cards(const std::string &mode, const fs::path &dir);
 int run_child(const std::string &mode, const std::string &card) {
+    if (mode.rfind("two-", 0) == 0) return run_two_cards(mode, ps2::os::path(card));
     ps2::g_options.memcard_path = card;
     ps2::os::set_env("PS2_TEST_CARD_DIRTY", mode == "raw-card" ? "0,raw" : "0");
     if (mode == "cut-card" || mode == "cut-file") ps2::os::set_env("PS2_TEST_CUT_BEFORE_RENAME", "1");
@@ -141,6 +143,37 @@ int run_child(const std::string &mode, const std::string &card) {
     ps2::iop::sio2::reset();
     ps2::iop::sio2::flush_cards();  // frame 0: the test switch marks the card as changed
     if (mode == "crash-card") return ps2::save_memory_card_after_crash(nullptr) == 1 ? 0 : 1;
+    ps2::flush_memory_card(false);
+    return 0;
+}
+
+// Slot 2 (local change): `dir` holds a.ps2 / b.ps2 / c.ps2. Modes:
+//   two-slot2: only slot 2 has a card (b.ps2); two-both: a.ps2 in slot 1, b.ps2 in slot 2; two-same: a.ps2 in both slots;
+//   two-swap: a.ps2 in slot 1, changed, then swapped for c.ps2 (refused while a is unwritten, done after the write).
+// Exit code 0 = everything the mode expects happened, else the number of the step that went wrong.
+int run_two_cards(const std::string &mode, const fs::path &dir) {
+    const std::string a = ps2::os::utf8(dir / "a.ps2"), b = ps2::os::utf8(dir / "b.ps2"), c = ps2::os::utf8(dir / "c.ps2");
+    ps2::os::set_env("PS2_TEST_CARD_DIRTY", "0");
+    if (mode == "two-slot2") ps2::g_options.memcard2_path = b;
+    if (mode == "two-both") ps2::g_options.memcard_path = a, ps2::g_options.memcard2_path = b;
+    if (mode == "two-same") ps2::g_options.memcard_path = a, ps2::g_options.memcard2_path = a;
+    if (mode == "two-swap") ps2::g_options.memcard_path = a;
+    ps2::iop::sio2::reset();
+    if (mode == "two-same" && !ps2::memory_card_file(1).empty()) return 1;  // one card in two slots is refused
+    if (mode == "two-slot2" && !ps2::memory_card_file(0).empty()) return 2;
+    ps2::iop::sio2::flush_cards();  // frame 0: every card in a slot is marked as changed
+    if (mode == "two-swap") {
+        std::string why;
+        if (ps2::swap_memory_card(0, c, &why)) return 3;  // card a is changed but not written yet: busy
+        if (ps2::swap_memory_card(1, a, &why)) return 4;  // a is in slot 1: it cannot go into slot 2
+        ps2::flush_memory_card(false);
+        if (!ps2::swap_memory_card(0, c, &why)) return 5;
+        if (ps2::memory_card_file(0) != c) return 6;  // the swap that is asked for counts at once
+        ps2::iop::sio2::flush_cards();  // the swap is done; frame 0 again, so c is marked too
+        if (ps2::memory_card_file(0) != c) return 7;
+        std::vector<std::uint8_t> image;
+        if (!ps2::memory_card_image(image, true, 0)) return 8;
+    }
     ps2::flush_memory_card(false);
     return 0;
 }
@@ -162,6 +195,47 @@ void bad_card(const char *what, const Bytes &content) {
     check(child("card", card) == 0, std::string(what) + ": the run ended normally");
     check(read_file(card) == content, std::string(what) + ": the card file is byte for byte as it was");
     check(has_marker(read_file(fresh)), std::string(what) + ": the game's save went to card.fresh.ps2");
+}
+
+void slot2_cases() {
+    {
+        const fs::path dir = fresh_folder();
+        check(child("two-slot2", dir) == 0, "slot 2 only: the run ended normally and slot 1 stayed empty");
+        check(has_marker(read_file(dir / "b.ps2")), "slot 2 only: the save went to b.ps2");
+        check(!fs::exists(dir / "a.ps2"), "slot 2 only: nothing was written for slot 1");
+    }
+    {
+        const fs::path dir = fresh_folder();
+        const Bytes before_a = valid_card(30), before_b = valid_card(31);
+        write_file(dir / "a.ps2", before_a);
+        write_file(dir / "b.ps2", before_b);
+        check(child("two-both", dir) == 0, "two cards: the run ended normally");
+        const Bytes after_a = read_file(dir / "a.ps2"), after_b = read_file(dir / "b.ps2");
+        check(has_marker(after_a) && same_but_marker(after_a, before_a), "two cards: slot 1's file has only its own change");
+        check(has_marker(after_b) && same_but_marker(after_b, before_b), "two cards: slot 2's file has only its own change");
+        check(!fs::exists(dir / "a.ps2.lock") || !g_windows, "two cards: slot 1's lock is gone after the run");
+        check(!fs::exists(dir / "b.ps2.lock") || !g_windows, "two cards: slot 2's lock is gone after the run");
+    }
+    {
+        const fs::path dir = fresh_folder();
+        const Bytes before = valid_card(32);
+        write_file(dir / "a.ps2", before);
+        check(child("two-same", dir) == 0, "one card in both slots: refused for slot 2, the run ended normally");
+        const Bytes after = read_file(dir / "a.ps2");
+        check(has_marker(after) && same_but_marker(after, before), "one card in both slots: slot 1 still saves to it");
+    }
+    {
+        const fs::path dir = fresh_folder();
+        const Bytes before_a = valid_card(33), before_c = valid_card(34);
+        write_file(dir / "a.ps2", before_a);
+        write_file(dir / "c.ps2", before_c);
+        const int got = child("two-swap", dir);
+        check(got == 0, "swap: every step went as expected (step " + std::to_string(got) + " did not)");
+        const Bytes after_a = read_file(dir / "a.ps2"), after_c = read_file(dir / "c.ps2");
+        check(has_marker(after_a) && same_but_marker(after_a, before_a), "swap: the card taken out was written first");
+        check(has_marker(after_c) && same_but_marker(after_c, before_c), "swap: the card put in is used from then on");
+        check(!fs::exists(dir / "a.ps2.lock") || !g_windows, "swap: the lock of the card taken out was given back");
+    }
 }
 
 void card_cases() {
@@ -445,6 +519,7 @@ void game_folders() {
 int main(int argc, char **argv) {
     if (argc == 3 && std::string(argv[1]).find("card") != std::string::npos) return run_child(argv[1], argv[2]);
     if (argc == 3 && std::string(argv[1]) == "cut-file") return run_child(argv[1], argv[2]);
+    if (argc == 3 && std::string(argv[1]).rfind("two-", 0) == 0) return run_child(argv[1], argv[2]);
     g_self = fs::absolute(argv[0]).string();
 #ifdef _WIN32
     if (g_self.size() < 4 || g_self.substr(g_self.size() - 4) != ".exe") g_self += ".exe";
@@ -455,6 +530,7 @@ int main(int argc, char **argv) {
     fs::create_directories(g_work);
     game_folders();
     card_cases();
+    slot2_cases();
     guard_cases();
     file_cases();
     std::printf("save files: %d of %d checks passed, %d failed\n", checks - failed, checks, failed);

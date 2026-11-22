@@ -121,12 +121,12 @@ bool lookup(const std::string &text, int &input) {
 const char *action_name(int action) { return kInfo[action].name; }
 
 const char *look_name(int look) {
-    static const char *const names[kLookCount] = {"Crisp", "Crisp + smooth edges", "Soft", "Soft + smooth edges", "Sharp", "Sharp + smooth edges"};
+    static const char *const names[kLookCount] = {"Crisp", "Crisp + smooth edges", "Soft", "Soft + smooth edges", "Sharp", "Sharp + smooth edges", "Filter off", "Filter off + smooth edges"};
     return names[look < 0 || look >= kLookCount ? 0 : look];
 }
 
 const char *look_word(int look) {
-    static const char *const words[kLookCount] = {"crisp", "crisp_edges", "soft", "soft_edges", "sharp", "sharp_edges"};
+    static const char *const words[kLookCount] = {"crisp", "crisp_edges", "soft", "soft_edges", "sharp", "sharp_edges", "plain", "plain_edges"};
     return words[look < 0 || look >= kLookCount ? 0 : look];
 }
 
@@ -273,7 +273,7 @@ void parse(const std::string &text, Config &config, std::vector<std::string> &pr
             int found = -1;
             for (int i = 0; i < kLookCount; ++i)
                 if (v == squash(look_word(i)) || v == std::to_string(i)) found = i;
-            if (found < 0) bad("look is sharp edges, sharp, crisp, crisp edges, soft or soft edges, ignored");
+            if (found < 0) bad("look is sharp edges, sharp, crisp, crisp edges, soft, soft edges, plain or plain edges, ignored");
             else config.look = found;
             continue;
         }

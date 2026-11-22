@@ -775,15 +775,37 @@ bool kon_late() {
     return on;
 }
 
+// local change: the chip makes its sound in batches of 32 samples (0.67 ms), so between two batches a voice's envelope stands still,
+// and right after a key on it reads 0 until the next batch, though a real chip has been raising it every sample since. The Sims 2's
+// sound driver (multi_streamer) keys on a music stream's voice and reads its ENVX about 0.1 ms later: a 0 there makes it take the
+// voice for dead, key it off and start the stream again, over and over (items "loading" for ever in create-a-Sim, music stutter;
+// whether a batch fell in between depended on timing, so on PS2_DISC_SPEED). A read of ENVX between batches now answers the level
+// the envelope has reached by now: a copy of the voice is run on for the samples since the last batch or its key on, whichever is
+// later. The voice itself is not changed (the next batch makes the real sound), and none of this is in a save state.
+std::uint64_t g_kon_at[2][24] = {};
+
+std::int32_t envelope_now(const Core &k, unsigned i) {
+    const Voice &v = k.voices[i];
+    if (v.phase == kOff || v.key_on) return v.env.level;
+    const std::uint64_t from = std::max(g_last_tick, g_kon_at[&k - g_cores][i]), at = kernel::now();
+    if (!g_last_tick || at <= from) return v.env.level;
+    const std::uint64_t samples = std::min<std::uint64_t>((at - from) / kCyclesPerSample, kBatch);
+    Voice copy = v;
+    for (std::uint64_t n = 0; n < samples && copy.phase != kOff; ++n) update_envelope(copy);
+    return copy.env.level;
+}
+
 void key(Core &k, std::uint32_t mask, bool on) {
     for (int i = 0; i < 24; ++i) {
         if (!(mask & (1u << i))) continue;
         Voice &v = k.voices[i];
         if (trace_kon())
-            std::fprintf(stderr, "[kon] %.4f s core %d voice %d %s (pending %d phase %d env %d end %d ssa 0x%05X)\n", trace_time(), static_cast<int>(&k - g_cores), i,
-                         on ? "on" : "off", v.key_on ? 1 : 0, static_cast<int>(v.phase), v.env.level, v.end ? 1 : 0, v.ssa);
+            std::fprintf(stderr, "[kon] %.4f s core %d voice %d %s (pending %d phase %d env %d end %d ssa 0x%05X pitch 0x%04X vol %04X/%04X)\n", trace_time(),
+                         static_cast<int>(&k - g_cores), i, on ? "on" : "off", v.key_on ? 1 : 0, static_cast<int>(v.phase), v.env.level, v.end ? 1 : 0, v.ssa,
+                         v.pitch, v.voll, v.volr);
         if (on) {
             v.key_on = true;
+            g_kon_at[&k - g_cores][i] = kernel::now();
             if (!kon_late()) key_on(v);
         } else if (v.key_on) v.key_on = false;
         else if (v.phase != kOff) v.phase = kRelease;
@@ -807,10 +829,20 @@ void key(Core &k, std::uint32_t mask, bool on) {
     }
 }
 
+std::uint32_t read_core_real(int core, std::uint32_t off);
+// local change: PS2_TRACE_KON=2 also prints every read of a core's registers (what a sound driver looks at after a key on)
 std::uint32_t read_core(int core, std::uint32_t off) {
+    const std::uint32_t value = read_core_real(core, off);
+    static const bool reads = [] { const char *e = std::getenv("PS2_TRACE_KON"); return e && e[0] == '2'; }();
+    if (reads) std::fprintf(stderr, "[spu2-read] %.4f s core %d reg 0x%03X -> 0x%04X\n", trace_time(), core, off, value);
+    return value;
+}
+
+std::uint32_t read_core_real(int core, std::uint32_t off) {
     Core &k = g_cores[core];
     if (trace_kon() && off < 0x180u && (off & 0xFu) == 0xA && k.voices[off >> 4].key_on)
         std::fprintf(stderr, "[kon] %.4f s core %d voice %u: ENVX read (%d) while its key on waits\n", trace_time(), core, off >> 4, k.voices[off >> 4].env.level);
+    if (off < 0x180u && (off & 0xFu) == 0xA) return static_cast<std::uint32_t>(envelope_now(k, off >> 4));
     if (off < 0x180u || (off >= 0x1C0u && off < 0x2E0u)) return read_voice(k, off);
     switch (off) {
     case 0x19A: return k.attr;
