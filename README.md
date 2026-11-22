@@ -73,7 +73,7 @@ Roughly in this order:
 
 - [ps2-native-recomp](https://github.com/exoteric33/ps2-native-recomp) by exoteric33, built on
   [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) by Samir Nuri: the static recompiler this project is built on (MIT)
-- **SomberTwilight**: the HD texture pack (downloaded from its official link, with permission)
+- **SomberTwilight**: the HD texture pack (downloaded from its official link)
 - [PCSX2 patches](https://github.com/PCSX2/pcsx2_patches): the 50 FPS and Widescreen 16:9 patches (downloaded at install)
 - [Varela Round](https://fonts.google.com/specimen/Varela+Round): the menu font (SIL Open Font License)
 - [SDL2](https://www.libsdl.org/)
