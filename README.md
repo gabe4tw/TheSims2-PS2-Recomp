@@ -12,7 +12,7 @@ your own copy of the game.
 ## What you get
 
 - **Smooth frame rates:** 50/60 fps instead of the original 25/30, and higher rates on high-refresh screens.
-- **Widescreen:** 4:3, 16:9 or 21:9, with the menus and HUD kept at their proper shape instead of stretched.
+- **Widescreen:** 4:3, 16:9 or 21:9, with the menus and HUD kept at their proper shape instead of stretched. (21:9 remains untested)
 - **A sharper picture:** the game is drawn at up to 4x the PS2 resolution, with anti-aliasing (Off / Fast / Extra) and
   picture filters.
 - **HD textures:** SomberTwilight's HD texture pack, downloaded at install and switchable in Settings > Textures.
